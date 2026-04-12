@@ -20,14 +20,14 @@ class SqsConnector implements ConnectorInterface
     {
         $config = $this->getDefaultConfiguration($config);
 
-        if (! empty($config['key']) && ! empty($config['secret'])) {
+        if ($credentials = $this->resolveCredentialProvider($config)) {
+            $config['credentials'] = $credentials;
+        } elseif (! empty($config['key']) && ! empty($config['secret'])) {
             $config['credentials'] = Arr::only($config, ['key', 'secret']);
 
             if (! empty($config['token'])) {
                 $config['credentials']['token'] = $config['token'];
             }
-        } elseif ($credentials = $this->resolveCredentialProvider($config)) {
-            $config['credentials'] = $credentials;
         }
 
         return new SqsQueue(
