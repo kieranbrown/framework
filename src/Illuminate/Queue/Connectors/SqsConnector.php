@@ -19,21 +19,7 @@ class SqsConnector implements ConnectorInterface
     public function connect(array $config)
     {
         $config = $this->getDefaultConfiguration($config);
-
-        if (is_string($config['credentials'] ?? null)) {
-            $config['credentials'] = $this->resolveCredentialProvider($config['credentials']);
-        } elseif (is_array($config['credentials'] ?? null) && isset($config['credentials']['provider'])) {
-            $config['credentials'] = $this->resolveCredentialProvider(
-                $config['credentials']['provider'],
-                Arr::except($config['credentials'], ['provider'])
-            );
-        } elseif (! empty($config['key']) && ! empty($config['secret'])) {
-            $config['credentials'] = Arr::only($config, ['key', 'secret']);
-
-            if (! empty($config['token'])) {
-                $config['credentials']['token'] = $config['token'];
-            }
-        }
+        $config = $this->resolveCredentials($config);
 
         return new SqsQueue(
             new SqsClient(
@@ -47,9 +33,38 @@ class SqsConnector implements ConnectorInterface
     }
 
     /**
+     * Resolve the credentials for the given config.
+     *
+     * @param  array  $config
+     * @return array
+     */
+    protected function resolveCredentials(array $config)
+    {
+        $credentials = $config['credentials'] ?? null;
+
+        if (is_string($credentials)) {
+            $config['credentials'] = $this->resolveCredentialProvider($credentials);
+        } elseif (is_array($credentials) && isset($credentials['provider'])) {
+            $config['credentials'] = $this->resolveCredentialProvider(
+                $credentials['provider'],
+                Arr::except($credentials, ['provider'])
+            );
+        } elseif (! empty($config['key']) && ! empty($config['secret'])) {
+            $config['credentials'] = Arr::only($config, ['key', 'secret']);
+
+            if (! empty($config['token'])) {
+                $config['credentials']['token'] = $config['token'];
+            }
+        }
+
+        return $config;
+    }
+
+    /**
      * Resolve a credential provider by name.
      *
      * @param  string  $provider
+     * @param  array  $config
      * @return callable
      *
      * @throws \InvalidArgumentException
