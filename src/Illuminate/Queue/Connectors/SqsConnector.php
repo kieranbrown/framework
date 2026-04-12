@@ -2,9 +2,11 @@
 
 namespace Illuminate\Queue\Connectors;
 
+use Aws\Credentials\CredentialProvider;
 use Aws\Sqs\SqsClient;
 use Illuminate\Queue\SqsQueue;
 use Illuminate\Support\Arr;
+use InvalidArgumentException;
 
 class SqsConnector implements ConnectorInterface
 {
@@ -18,7 +20,9 @@ class SqsConnector implements ConnectorInterface
     {
         $config = $this->getDefaultConfiguration($config);
 
-        if (! empty($config['key']) && ! empty($config['secret'])) {
+        if (is_string($config['credentials'] ?? null)) {
+            $config['credentials'] = $this->resolveCredentialProvider($config['credentials']);
+        } elseif (! empty($config['key']) && ! empty($config['secret'])) {
             $config['credentials'] = Arr::only($config, ['key', 'secret']);
 
             if (! empty($config['token'])) {
@@ -35,6 +39,25 @@ class SqsConnector implements ConnectorInterface
             $config['suffix'] ?? '',
             $config['after_commit'] ?? null
         );
+    }
+
+    /**
+     * Resolve a credential provider by name.
+     *
+     * @param  string  $provider
+     * @return callable
+     *
+     * @throws \InvalidArgumentException
+     */
+    protected function resolveCredentialProvider(string $provider)
+    {
+        return match ($provider) {
+            'ecs' => CredentialProvider::ecsCredentials(),
+            'instance' => CredentialProvider::instanceProfile(),
+            default => throw new InvalidArgumentException(
+                "Invalid credential provider [{$provider}]."
+            ),
+        };
     }
 
     /**

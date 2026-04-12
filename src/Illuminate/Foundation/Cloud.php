@@ -27,6 +27,7 @@ class Cloud
         (match ($bootstrapper) {
             LoadConfiguration::class => function () use ($app) {
                 static::configureDisks($app);
+                static::configureManagedQueues($app);
                 static::configureUnpooledPostgresConnection($app);
                 static::ensureMigrationsUseUnpooledConnection($app);
             },
@@ -65,6 +66,28 @@ class Cloud
             if ($disk['is_default'] ?? false) {
                 $app['config']->set('filesystems.default', $disk['disk']);
             }
+        }
+    }
+
+    /**
+     * Configure the managed queue credentials if applicable.
+     */
+    public static function configureManagedQueues(Application $app): void
+    {
+        if (($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'] ?? null) !== '1') {
+            return;
+        }
+
+        $app['config']->set(
+            'queue.connections.sqs.credentials',
+            'ecs'
+        );
+
+        if (isset($_SERVER['LARAVEL_CLOUD_REGION'])) {
+            $app['config']->set(
+                'queue.connections.sqs.region',
+                $_SERVER['LARAVEL_CLOUD_REGION']
+            );
         }
     }
 
