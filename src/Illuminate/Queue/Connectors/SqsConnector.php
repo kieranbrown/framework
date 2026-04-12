@@ -22,6 +22,11 @@ class SqsConnector implements ConnectorInterface
 
         if (is_string($config['credentials'] ?? null)) {
             $config['credentials'] = $this->resolveCredentialProvider($config['credentials']);
+        } elseif (is_array($config['credentials'] ?? null) && isset($config['credentials']['provider'])) {
+            $config['credentials'] = $this->resolveCredentialProvider(
+                $config['credentials']['provider'],
+                Arr::except($config['credentials'], ['provider'])
+            );
         } elseif (! empty($config['key']) && ! empty($config['secret'])) {
             $config['credentials'] = Arr::only($config, ['key', 'secret']);
 
@@ -49,11 +54,11 @@ class SqsConnector implements ConnectorInterface
      *
      * @throws \InvalidArgumentException
      */
-    protected function resolveCredentialProvider(string $provider)
+    protected function resolveCredentialProvider(string $provider, array $config = [])
     {
         return match ($provider) {
-            'ecs' => CredentialProvider::ecsCredentials(),
-            'instance' => CredentialProvider::instanceProfile(),
+            'ecs' => CredentialProvider::ecsCredentials($config),
+            'instance' => CredentialProvider::instanceProfile($config),
             default => throw new InvalidArgumentException(
                 "Invalid credential provider [{$provider}]."
             ),

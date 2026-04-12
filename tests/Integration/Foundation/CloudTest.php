@@ -53,6 +53,39 @@ class CloudTest extends TestCase
         unset($_SERVER['LARAVEL_CLOUD_DISK_CONFIG']);
     }
 
+    #[WithConfig('queue.connections.sqs', ['driver' => 'sqs', 'region' => 'us-east-1', 'queue' => 'default'])]
+    public function test_it_configures_managed_queue_credentials()
+    {
+        $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'] = '1';
+
+        Cloud::configureManagedQueues($this->app);
+
+        $this->assertEquals('ecs', $this->app['config']->get('queue.connections.sqs.credentials'));
+
+        unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES']);
+    }
+
+    #[WithConfig('queue.connections.sqs', ['driver' => 'sqs', 'region' => 'us-east-1', 'queue' => 'default'])]
+    public function test_it_does_not_configure_managed_queues_when_not_enabled()
+    {
+        Cloud::configureManagedQueues($this->app);
+
+        $this->assertNull($this->app['config']->get('queue.connections.sqs.credentials'));
+    }
+
+    #[WithConfig('queue.connections.sqs', ['driver' => 'sqs', 'region' => 'us-east-1', 'queue' => 'default'])]
+    public function test_it_configures_managed_queue_region()
+    {
+        $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'] = '1';
+        $_SERVER['LARAVEL_CLOUD_REGION'] = 'us-west-2';
+
+        Cloud::configureManagedQueues($this->app);
+
+        $this->assertEquals('us-west-2', $this->app['config']->get('queue.connections.sqs.region'));
+
+        unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'], $_SERVER['LARAVEL_CLOUD_REGION']);
+    }
+
     public function test_it_respects_log_levels()
     {
         if (isset($_SERVER['LOG_LEVEL'])) {
