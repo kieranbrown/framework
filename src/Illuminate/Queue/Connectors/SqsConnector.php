@@ -19,7 +19,16 @@ class SqsConnector implements ConnectorInterface
     public function connect(array $config)
     {
         $config = $this->getDefaultConfiguration($config);
-        $config = $this->resolveCredentials($config);
+
+        if (! empty($config['key']) && ! empty($config['secret'])) {
+            $config['credentials'] = Arr::only($config, ['key', 'secret']);
+
+            if (! empty($config['token'])) {
+                $config['credentials']['token'] = $config['token'];
+            }
+        } elseif ($credentials = $this->resolveCredentialProvider($config)) {
+            $config['credentials'] = $credentials;
+        }
 
         return new SqsQueue(
             new SqsClient(
@@ -33,47 +42,28 @@ class SqsConnector implements ConnectorInterface
     }
 
     /**
-     * Resolve the credentials for the given config.
+     * Resolve a credential provider from the given config.
      *
      * @param  array  $config
-     * @return array
-     */
-    protected function resolveCredentials(array $config)
-    {
-        $credentials = $config['credentials'] ?? null;
-
-        if (is_string($credentials)) {
-            $config['credentials'] = $this->resolveCredentialProvider($credentials);
-        } elseif (is_array($credentials) && isset($credentials['provider'])) {
-            $config['credentials'] = $this->resolveCredentialProvider(
-                $credentials['provider'],
-                Arr::except($credentials, ['provider'])
-            );
-        } elseif (! empty($config['key']) && ! empty($config['secret'])) {
-            $config['credentials'] = Arr::only($config, ['key', 'secret']);
-
-            if (! empty($config['token'])) {
-                $config['credentials']['token'] = $config['token'];
-            }
-        }
-
-        return $config;
-    }
-
-    /**
-     * Resolve a credential provider by name.
-     *
-     * @param  string  $provider
-     * @param  array  $config
-     * @return callable
+     * @return callable|null
      *
      * @throws \InvalidArgumentException
      */
-    protected function resolveCredentialProvider(string $provider, array $config = [])
+    protected function resolveCredentialProvider(array $config)
     {
+        $credentials = $config['credentials'] ?? null;
+
+        $provider = is_string($credentials) ? $credentials : ($credentials['provider'] ?? null);
+
+        if (is_null($provider)) {
+            return null;
+        }
+
+        $options = is_array($credentials) ? Arr::except($credentials, ['provider']) : [];
+
         return match ($provider) {
-            'ecs' => CredentialProvider::ecsCredentials($config),
-            'instance' => CredentialProvider::instanceProfile($config),
+            'ecs' => CredentialProvider::ecsCredentials($options),
+            'instance' => CredentialProvider::instanceProfile($options),
             default => throw new InvalidArgumentException(
                 "Invalid credential provider [{$provider}]."
             ),
