@@ -234,7 +234,35 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
 
         $this->registerTerminatingCallback();
 
+        if (count($this->pendingBatch[$queueUrl]) >= 10) {
+            $this->flushQueue($queueUrl);
+        }
+
         return $id;
+    }
+
+    /**
+     * Flush pending batched messages for a specific queue URL.
+     *
+     * @param  string  $queueUrl
+     * @return void
+     */
+    protected function flushQueue($queueUrl)
+    {
+        $entries = $this->pendingBatch[$queueUrl] ?? [];
+
+        unset($this->pendingBatch[$queueUrl]);
+
+        if (empty($entries)) {
+            return;
+        }
+
+        $response = $this->sqs->sendMessageBatch([
+            'QueueUrl' => $queueUrl,
+            'Entries' => $entries,
+        ]);
+
+        $this->handleBatchFailures($response, $queueUrl);
     }
 
     /**
@@ -244,16 +272,33 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      */
     public function flush()
     {
-        foreach ($this->pendingBatch as $queueUrl => $entries) {
-            foreach (array_chunk($entries, 10) as $batch) {
-                $this->sqs->sendMessageBatch([
-                    'QueueUrl' => $queueUrl,
-                    'Entries' => $batch,
-                ]);
-            }
+        foreach (array_keys($this->pendingBatch) as $queueUrl) {
+            $this->flushQueue($queueUrl);
+        }
+    }
+
+    /**
+     * Handle any failed messages from a sendMessageBatch response.
+     *
+     * @param  \Aws\Result  $response
+     * @param  string  $queueUrl
+     * @return void
+     *
+     * @throws \RuntimeException
+     */
+    protected function handleBatchFailures($response, $queueUrl)
+    {
+        $failed = $response->get('Failed') ?? [];
+
+        if (empty($failed)) {
+            return;
         }
 
-        $this->pendingBatch = [];
+        $ids = array_column($failed, 'Id');
+
+        throw new \RuntimeException(
+            sprintf('Failed to send %d message(s) to SQS queue [%s]: %s', count($failed), $queueUrl, implode(', ', $ids))
+        );
     }
 
     /**
@@ -384,7 +429,10 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      */
     public function bulk($jobs, $data = '', $queue = null)
     {
-        if ($this->batch) {
+        $wasBatching = $this->batch;
+        $this->batch = true;
+
+        try {
             foreach ((array) $jobs as $job) {
                 if (isset($job->delay)) {
                     $this->later($job->delay, $job, $data, $queue);
@@ -393,48 +441,9 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
                 }
             }
 
-            return;
-        }
-
-        $entries = [];
-        $queueUrl = $this->getQueue($queue);
-
-        foreach ((array) $jobs as $job) {
-            if (isset($job->delay)) {
-                $this->later($job->delay, $job, $data, $queue);
-            } else {
-                $payload = $this->createPayload($job, $queue ?: $this->default, $data);
-                $options = $this->getQueueableOptions($job, $queue, $payload);
-                $decoded = json_decode($payload, true);
-                $id = $decoded['uuid'] ?? Str::uuid()->toString();
-
-                $this->raiseJobQueueingEvent($queue, $job, $payload, null);
-
-                $entries[] = [
-                    'job' => $job,
-                    'payload' => $payload,
-                    'entry' => [
-                        'Id' => $id,
-                        'MessageBody' => $payload,
-                        ...$options,
-                    ],
-                ];
-            }
-        }
-
-        foreach (array_chunk($entries, 10) as $batch) {
-            $response = $this->sqs->sendMessageBatch([
-                'QueueUrl' => $queueUrl,
-                'Entries' => array_column($batch, 'entry'),
-            ]);
-
-            foreach ($response->get('Successful') ?? [] as $success) {
-                $entry = collect($batch)->firstWhere('entry.Id', $success['Id']);
-
-                if ($entry) {
-                    $this->raiseJobQueuedEvent($queue, $success['MessageId'], $entry['job'], $entry['payload'], null);
-                }
-            }
+            $this->flush();
+        } finally {
+            $this->batch = $wasBatching;
         }
     }
 
@@ -515,15 +524,5 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
     public function getSqs()
     {
         return $this->sqs;
-    }
-
-    /**
-     * Flush any pending batched messages when the queue is destroyed.
-     */
-    public function __destruct()
-    {
-        if (! empty($this->pendingBatch)) {
-            $this->flush();
-        }
     }
 }

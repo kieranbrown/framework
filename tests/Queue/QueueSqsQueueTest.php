@@ -631,35 +631,40 @@ class QueueSqsQueueTest extends TestCase
 
         $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 3;
-        })->andReturn(new Result([]));
+        })->andReturn(new Result(['Failed' => []]));
 
         $queue->flush();
 
         $this->assertEquals(0, $queue->pendingBatchCount());
     }
 
-    public function testFlushChunksMessagesIntoGroupsOfTen()
+    public function testBufferAutoFlushesAtTenMessages()
     {
         $queue = $this->getMockBuilder(SqsQueue::class)->onlyMethods(['createPayload', 'getQueue'])->setConstructorArgs([$this->sqs, $this->queueName, $this->account, '', false, true])->getMock();
         $queue->setContainer($container = m::spy(Container::class));
         $queue->expects($this->exactly(12))->method('createPayload')->willReturn($this->mockedPayload);
         $queue->expects($this->exactly(12))->method('getQueue')->willReturn($this->queueUrl);
 
+        // First batch of 10 auto-flushes
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
+            return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 10;
+        })->andReturn(new Result(['Failed' => []]));
+
         for ($i = 0; $i < 12; $i++) {
             $queue->push($this->mockedJob, $this->mockedData, $this->queueName);
         }
 
-        $this->assertEquals(12, $queue->pendingBatchCount());
+        // Only 2 remain in the buffer after auto-flush
+        $this->assertEquals(2, $queue->pendingBatchCount());
 
-        $calls = 0;
-        $this->sqs->shouldReceive('sendMessageBatch')->twice()->withArgs(function ($args) use (&$calls) {
-            $calls++;
-
-            return $args['QueueUrl'] === $this->queueUrl
-                && count($args['Entries']) === ($calls === 1 ? 10 : 2);
-        })->andReturn(new Result([]));
+        // Flush the remaining 2
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
+            return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 2;
+        })->andReturn(new Result(['Failed' => []]));
 
         $queue->flush();
+
+        $this->assertEquals(0, $queue->pendingBatchCount());
     }
 
     public function testFlushGroupsMessagesByQueueUrl()
@@ -675,11 +680,11 @@ class QueueSqsQueueTest extends TestCase
 
         $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 2;
-        })->andReturn(new Result([]));
+        })->andReturn(new Result(['Failed' => []]));
 
         $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->fifoQueueUrl && count($args['Entries']) === 1;
-        })->andReturn(new Result([]));
+        })->andReturn(new Result(['Failed' => []]));
 
         $queue->flush();
     }
@@ -698,18 +703,65 @@ class QueueSqsQueueTest extends TestCase
         $this->assertEquals(0, $queue->pendingBatchCount());
     }
 
-    public function testBulkUsesSendMessageBatchWhenBatchingDisabled()
+    public function testBulkUsesSendMessageBatch()
     {
         $queue = $this->getMockBuilder(SqsQueue::class)->onlyMethods(['createPayload', 'getQueue'])->setConstructorArgs([$this->sqs, $this->queueName, $this->account, '', false, false])->getMock();
         $queue->setContainer($container = m::spy(Container::class));
         $queue->expects($this->exactly(2))->method('createPayload')->willReturn($this->mockedPayload);
-        $queue->expects($this->once())->method('getQueue')->willReturn($this->queueUrl);
+        $queue->expects($this->exactly(2))->method('getQueue')->willReturn($this->queueUrl);
 
         $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 2;
-        })->andReturn(new Result(['Successful' => []]));
+        })->andReturn(new Result(['Failed' => []]));
 
         $queue->bulk([$this->mockedJob, $this->mockedJob], $this->mockedData, $this->queueName);
+
+        // batch flag should be restored to false after bulk
+        $this->assertEquals(0, $queue->pendingBatchCount());
+    }
+
+    public function testBulkRestoresBatchFlagAfterFailure()
+    {
+        $queue = $this->getMockBuilder(SqsQueue::class)->onlyMethods(['createPayload', 'getQueue'])->setConstructorArgs([$this->sqs, $this->queueName, $this->account, '', false, false])->getMock();
+        $queue->setContainer($container = m::spy(Container::class));
+        $queue->expects($this->exactly(2))->method('createPayload')->willReturn($this->mockedPayload);
+        $queue->expects($this->exactly(3))->method('getQueue')->willReturn($this->queueUrl);
+
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->andReturn(new Result([
+            'Failed' => [['Id' => 'abc', 'Code' => 'InternalError', 'SenderFault' => false, 'Message' => 'test']],
+        ]));
+
+        try {
+            $queue->bulk([$this->mockedJob, $this->mockedJob], $this->mockedData, $this->queueName);
+            $this->fail('Expected RuntimeException');
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString('Failed to send 1 message(s)', $e->getMessage());
+        }
+
+        // Batch flag must be restored even after exception, so pushRaw sends immediately
+        $this->sqs->shouldReceive('sendMessage')->once()->with([
+            'QueueUrl' => $this->queueUrl, 'MessageBody' => $this->mockedPayload,
+        ])->andReturn($this->mockedSendMessageResponseModel);
+        $queue->pushRaw($this->mockedPayload, $this->queueUrl);
+    }
+
+    public function testFlushThrowsOnPartialFailure()
+    {
+        $queue = new SqsQueue($this->sqs, $this->queueName, $this->prefix, '', false, true);
+        $queue->setContainer($container = m::spy(Container::class));
+
+        $queue->pushRaw('{"uuid":"msg-1"}', $this->queueUrl);
+        $queue->pushRaw('{"uuid":"msg-2"}', $this->queueUrl);
+
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->andReturn(new Result([
+            'Successful' => [['Id' => 'msg-1', 'MessageId' => 'aws-id-1']],
+            'Failed' => [['Id' => 'msg-2', 'Code' => 'InternalError', 'SenderFault' => false, 'Message' => 'Oops']],
+        ]));
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Failed to send 1 message(s)');
+
+        $queue->flush();
     }
 
     public function testDelayedPushProperlyPushesJobStringOntoSqsFifoQueueWithoutDelay()
