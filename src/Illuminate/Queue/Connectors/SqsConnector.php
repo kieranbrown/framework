@@ -33,7 +33,8 @@ class SqsConnector implements ConnectorInterface
             $config['queue'],
             $config['prefix'] ?? '',
             $config['suffix'] ?? '',
-            $config['after_commit'] ?? null
+            $config['after_commit'] ?? null,
+            $config['batch'] ?? false
         );
     }
 

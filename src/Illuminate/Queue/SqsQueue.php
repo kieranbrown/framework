@@ -39,6 +39,27 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
     protected $suffix;
 
     /**
+     * Indicates if messages should be batched before sending.
+     *
+     * @var bool
+     */
+    protected $batch = false;
+
+    /**
+     * The pending messages to be sent in a batch, keyed by queue URL.
+     *
+     * @var array<string, array<int, array{Id: string, MessageBody: string, DelaySeconds?: int, MessageGroupId?: string, MessageDeduplicationId?: string}>>
+     */
+    protected $pendingBatch = [];
+
+    /**
+     * Indicates if a terminating callback has been registered.
+     *
+     * @var bool
+     */
+    protected $terminatingCallbackRegistered = false;
+
+    /**
      * Create a new Amazon SQS queue instance.
      *
      * @param  \Aws\Sqs\SqsClient  $sqs
@@ -46,6 +67,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      * @param  string  $prefix
      * @param  string  $suffix
      * @param  bool  $dispatchAfterCommit
+     * @param  bool  $batch
      */
     public function __construct(
         SqsClient $sqs,
@@ -53,12 +75,14 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
         $prefix = '',
         $suffix = '',
         $dispatchAfterCommit = false,
+        $batch = false,
     ) {
         $this->sqs = $sqs;
         $this->prefix = $prefix;
         $this->default = $default;
         $this->suffix = $suffix;
         $this->dispatchAfterCommit = $dispatchAfterCommit;
+        $this->batch = $batch;
     }
 
     /**
@@ -178,9 +202,92 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      */
     public function pushRaw($payload, $queue = null, array $options = [])
     {
+        $queueUrl = $this->getQueue($queue);
+
+        if ($this->batch) {
+            return $this->buffer($queueUrl, $payload, $options);
+        }
+
         return $this->sqs->sendMessage([
-            'QueueUrl' => $this->getQueue($queue), 'MessageBody' => $payload, ...$options,
+            'QueueUrl' => $queueUrl, 'MessageBody' => $payload, ...$options,
         ])->get('MessageId');
+    }
+
+    /**
+     * Buffer a message to be sent in the next batch flush.
+     *
+     * @param  string  $queueUrl
+     * @param  string  $payload
+     * @param  array  $options
+     * @return string
+     */
+    protected function buffer($queueUrl, $payload, array $options)
+    {
+        $decoded = json_decode($payload, true);
+        $id = $decoded['uuid'] ?? Str::uuid()->toString();
+
+        $this->pendingBatch[$queueUrl][] = [
+            'Id' => $id,
+            'MessageBody' => $payload,
+            ...$options,
+        ];
+
+        $this->registerTerminatingCallback();
+
+        return $id;
+    }
+
+    /**
+     * Flush all pending batched messages to SQS.
+     *
+     * @return void
+     */
+    public function flush()
+    {
+        foreach ($this->pendingBatch as $queueUrl => $entries) {
+            foreach (array_chunk($entries, 10) as $batch) {
+                $this->sqs->sendMessageBatch([
+                    'QueueUrl' => $queueUrl,
+                    'Entries' => $batch,
+                ]);
+            }
+        }
+
+        $this->pendingBatch = [];
+    }
+
+    /**
+     * Register a terminating callback to flush pending messages.
+     *
+     * @return void
+     */
+    protected function registerTerminatingCallback()
+    {
+        if ($this->terminatingCallbackRegistered || ! $this->container) {
+            return;
+        }
+
+        $this->container->terminating(function () {
+            $this->flush();
+        });
+
+        $this->terminatingCallbackRegistered = true;
+    }
+
+    /**
+     * Get the number of pending batched messages.
+     *
+     * @return int
+     */
+    public function pendingBatchCount()
+    {
+        $count = 0;
+
+        foreach ($this->pendingBatch as $entries) {
+            $count += count($entries);
+        }
+
+        return $count;
     }
 
     /**
@@ -277,11 +384,56 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      */
     public function bulk($jobs, $data = '', $queue = null)
     {
+        if ($this->batch) {
+            foreach ((array) $jobs as $job) {
+                if (isset($job->delay)) {
+                    $this->later($job->delay, $job, $data, $queue);
+                } else {
+                    $this->push($job, $data, $queue);
+                }
+            }
+
+            return;
+        }
+
+        $entries = [];
+        $queueUrl = $this->getQueue($queue);
+
         foreach ((array) $jobs as $job) {
             if (isset($job->delay)) {
                 $this->later($job->delay, $job, $data, $queue);
             } else {
-                $this->push($job, $data, $queue);
+                $payload = $this->createPayload($job, $queue ?: $this->default, $data);
+                $options = $this->getQueueableOptions($job, $queue, $payload);
+                $decoded = json_decode($payload, true);
+                $id = $decoded['uuid'] ?? Str::uuid()->toString();
+
+                $this->raiseJobQueueingEvent($queue, $job, $payload, null);
+
+                $entries[] = [
+                    'job' => $job,
+                    'payload' => $payload,
+                    'entry' => [
+                        'Id' => $id,
+                        'MessageBody' => $payload,
+                        ...$options,
+                    ],
+                ];
+            }
+        }
+
+        foreach (array_chunk($entries, 10) as $batch) {
+            $response = $this->sqs->sendMessageBatch([
+                'QueueUrl' => $queueUrl,
+                'Entries' => array_column($batch, 'entry'),
+            ]);
+
+            foreach ($response->get('Successful') ?? [] as $success) {
+                $entry = collect($batch)->firstWhere('entry.Id', $success['Id']);
+
+                if ($entry) {
+                    $this->raiseJobQueuedEvent($queue, $success['MessageId'], $entry['job'], $entry['payload'], null);
+                }
             }
         }
     }
@@ -363,5 +515,15 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
     public function getSqs()
     {
         return $this->sqs;
+    }
+
+    /**
+     * Flush any pending batched messages when the queue is destroyed.
+     */
+    public function __destruct()
+    {
+        if (! empty($this->pendingBatch)) {
+            $this->flush();
+        }
     }
 }
