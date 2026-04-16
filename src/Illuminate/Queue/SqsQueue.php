@@ -470,21 +470,64 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      */
     public function bulk($jobs, $data = '', $queue = null)
     {
-        $wasBatching = $this->batch;
-        $this->batch = true;
+        $queueUrl = $this->getQueue($queue);
+        $promises = [];
 
-        try {
-            foreach ((array) $jobs as $job) {
-                if (isset($job->delay)) {
-                    $this->later($job->delay, $job, $data, $queue);
-                } else {
-                    $this->push($job, $data, $queue);
-                }
+        foreach (array_chunk((array) $jobs, 10) as $chunk) {
+            $entries = [];
+
+            foreach ($chunk as $job) {
+                $payload = $this->createPayload($job, $queue ?: $this->default, $data);
+                $decoded = json_decode($payload, true);
+
+                $entries[] = [
+                    'Id' => $decoded['uuid'] ?? Str::uuid()->toString(),
+                    'MessageBody' => $payload,
+                    ...$this->getQueueableOptions($job, $queue, $payload, $job->delay ?? null),
+                ];
             }
 
-            $this->flush();
-        } finally {
-            $this->batch = $wasBatching;
+            $promises[] = $this->sqs->sendMessageBatchAsync([
+                'QueueUrl' => $queueUrl,
+                'Entries' => $entries,
+            ]);
+        }
+
+        if (empty($promises)) {
+            return;
+        }
+
+        $results = Utils::settle($promises)->wait();
+
+        $allFailedIds = [];
+
+        foreach ($results as $index => $result) {
+            if ($result['state'] === 'rejected') {
+                $allFailedIds[$queueUrl][] = $result['reason']->getMessage();
+
+                continue;
+            }
+
+            $failed = $result['value']->get('Failed') ?? [];
+
+            if (! empty($failed)) {
+                $allFailedIds[$queueUrl] = array_merge(
+                    $allFailedIds[$queueUrl] ?? [],
+                    array_column($failed, 'Id')
+                );
+            }
+        }
+
+        if (! empty($allFailedIds)) {
+            $messages = [];
+
+            foreach ($allFailedIds as $url => $ids) {
+                $messages[] = sprintf('[%s]: %s', $url, implode(', ', $ids));
+            }
+
+            throw new \RuntimeException(
+                sprintf('Failed to send SQS message(s) — %s', implode('; ', $messages))
+            );
         }
     }
 
