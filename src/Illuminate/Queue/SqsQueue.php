@@ -231,8 +231,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      */
     protected function buffer($queueUrl, $payload, array $options)
     {
-        $decoded = json_decode($payload, true);
-        $id = $decoded['uuid'] ?? Str::uuid()->toString();
+        $id = Str::uuid()->toString();
 
         $this->pendingBatch[$queueUrl][] = [
             'Id' => $id,
@@ -478,10 +477,9 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
 
             foreach ($chunk as $job) {
                 $payload = $this->createPayload($job, $queue ?: $this->default, $data);
-                $decoded = json_decode($payload, true);
 
                 $entries[] = [
-                    'Id' => $decoded['uuid'] ?? Str::uuid()->toString(),
+                    'Id' => Str::uuid()->toString(),
                     'MessageBody' => $payload,
                     ...$this->getQueueableOptions($job, $queue, $payload, $job->delay ?? null),
                 ];
