@@ -3,6 +3,7 @@
 namespace Illuminate\Queue;
 
 use Aws\Sqs\SqsClient;
+use GuzzleHttp\Promise\Utils;
 use Illuminate\Contracts\Queue\ClearableQueue;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Jobs\SqsJob;
@@ -51,6 +52,13 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      * @var array<string, array<int, array{Id: string, MessageBody: string, DelaySeconds?: int, MessageGroupId?: string, MessageDeduplicationId?: string}>>
      */
     protected $pendingBatch = [];
+
+    /**
+     * In-flight async sendMessageBatch promises.
+     *
+     * @var array<int, array{promise: \GuzzleHttp\Promise\Promise, queueUrl: string}>
+     */
+    protected $pendingPromises = [];
 
     /**
      * Indicates if a terminating callback has been registered.
@@ -242,7 +250,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
     }
 
     /**
-     * Flush pending batched messages for a specific queue URL.
+     * Flush pending batched messages for a specific queue URL asynchronously.
      *
      * @param  string  $queueUrl
      * @return void
@@ -257,48 +265,81 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
             return;
         }
 
-        $response = $this->sqs->sendMessageBatch([
-            'QueueUrl' => $queueUrl,
-            'Entries' => $entries,
-        ]);
-
-        $this->handleBatchFailures($response, $queueUrl);
+        $this->pendingPromises[] = [
+            'promise' => $this->sqs->sendMessageBatchAsync([
+                'QueueUrl' => $queueUrl,
+                'Entries' => $entries,
+            ]),
+            'queueUrl' => $queueUrl,
+        ];
     }
 
     /**
-     * Flush all pending batched messages to SQS.
+     * Flush all pending batched messages to SQS and await any in-flight requests.
      *
      * @return void
+     *
+     * @throws \RuntimeException
      */
     public function flush()
     {
         foreach (array_keys($this->pendingBatch) as $queueUrl) {
             $this->flushQueue($queueUrl);
         }
+
+        $this->awaitPendingPromises();
     }
 
     /**
-     * Handle any failed messages from a sendMessageBatch response.
+     * Await all in-flight async batch requests and handle failures.
      *
-     * @param  \Aws\Result  $response
-     * @param  string  $queueUrl
      * @return void
      *
      * @throws \RuntimeException
      */
-    protected function handleBatchFailures($response, $queueUrl)
+    protected function awaitPendingPromises()
     {
-        $failed = $response->get('Failed') ?? [];
-
-        if (empty($failed)) {
+        if (empty($this->pendingPromises)) {
             return;
         }
 
-        $ids = array_column($failed, 'Id');
+        $promises = $this->pendingPromises;
+        $this->pendingPromises = [];
 
-        throw new \RuntimeException(
-            sprintf('Failed to send %d message(s) to SQS queue [%s]: %s', count($failed), $queueUrl, implode(', ', $ids))
-        );
+        $results = Utils::settle(array_column($promises, 'promise'))->wait();
+
+        $allFailedIds = [];
+
+        foreach ($results as $index => $result) {
+            $queueUrl = $promises[$index]['queueUrl'];
+
+            if ($result['state'] === 'rejected') {
+                $allFailedIds[$queueUrl][] = $result['reason']->getMessage();
+
+                continue;
+            }
+
+            $failed = $result['value']->get('Failed') ?? [];
+
+            if (! empty($failed)) {
+                $allFailedIds[$queueUrl] = array_merge(
+                    $allFailedIds[$queueUrl] ?? [],
+                    array_column($failed, 'Id')
+                );
+            }
+        }
+
+        if (! empty($allFailedIds)) {
+            $messages = [];
+
+            foreach ($allFailedIds as $queueUrl => $ids) {
+                $messages[] = sprintf('[%s]: %s', $queueUrl, implode(', ', $ids));
+            }
+
+            throw new \RuntimeException(
+                sprintf('Failed to send SQS message(s) — %s', implode('; ', $messages))
+            );
+        }
     }
 
     /**

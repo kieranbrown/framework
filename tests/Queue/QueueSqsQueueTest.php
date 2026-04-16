@@ -4,6 +4,8 @@ namespace Illuminate\Tests\Queue;
 
 use Aws\Result;
 use Aws\Sqs\SqsClient;
+use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Promise\RejectedPromise;
 use Illuminate\Bus\Dispatcher;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Bus\Dispatcher as DispatcherContract;
@@ -610,7 +612,7 @@ class QueueSqsQueueTest extends TestCase
         $queue->expects($this->once())->method('createPayload')->with($this->mockedJob, $this->queueName, $this->mockedData)->willReturn($this->mockedPayload);
         $queue->expects($this->once())->method('getQueue')->with($this->queueName)->willReturn($this->queueUrl);
         $this->sqs->shouldNotReceive('sendMessage');
-        $this->sqs->shouldNotReceive('sendMessageBatch');
+        $this->sqs->shouldNotReceive('sendMessageBatchAsync');
         $id = $queue->push($this->mockedJob, $this->mockedData, $this->queueName);
         $this->assertNotNull($id);
         $this->assertEquals(1, $queue->pendingBatchCount());
@@ -629,26 +631,26 @@ class QueueSqsQueueTest extends TestCase
 
         $this->assertEquals(3, $queue->pendingBatchCount());
 
-        $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 3;
-        })->andReturn(new Result(['Failed' => []]));
+        })->andReturn(Create::promiseFor(new Result(['Failed' => []])));
 
         $queue->flush();
 
         $this->assertEquals(0, $queue->pendingBatchCount());
     }
 
-    public function testBufferAutoFlushesAtTenMessages()
+    public function testBufferAutoFlushesAsyncAtTenMessages()
     {
         $queue = $this->getMockBuilder(SqsQueue::class)->onlyMethods(['createPayload', 'getQueue'])->setConstructorArgs([$this->sqs, $this->queueName, $this->account, '', false, true])->getMock();
         $queue->setContainer($container = m::spy(Container::class));
         $queue->expects($this->exactly(12))->method('createPayload')->willReturn($this->mockedPayload);
         $queue->expects($this->exactly(12))->method('getQueue')->willReturn($this->queueUrl);
 
-        // First batch of 10 auto-flushes
-        $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
+        // First batch of 10 auto-flushes asynchronously
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 10;
-        })->andReturn(new Result(['Failed' => []]));
+        })->andReturn(Create::promiseFor(new Result(['Failed' => []])));
 
         for ($i = 0; $i < 12; $i++) {
             $queue->push($this->mockedJob, $this->mockedData, $this->queueName);
@@ -657,10 +659,10 @@ class QueueSqsQueueTest extends TestCase
         // Only 2 remain in the buffer after auto-flush
         $this->assertEquals(2, $queue->pendingBatchCount());
 
-        // Flush the remaining 2
-        $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
+        // Flush awaits the in-flight promise and sends the remaining 2
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 2;
-        })->andReturn(new Result(['Failed' => []]));
+        })->andReturn(Create::promiseFor(new Result(['Failed' => []])));
 
         $queue->flush();
 
@@ -678,13 +680,13 @@ class QueueSqsQueueTest extends TestCase
 
         $this->assertEquals(3, $queue->pendingBatchCount());
 
-        $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 2;
-        })->andReturn(new Result(['Failed' => []]));
+        })->andReturn(Create::promiseFor(new Result(['Failed' => []])));
 
-        $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->fifoQueueUrl && count($args['Entries']) === 1;
-        })->andReturn(new Result(['Failed' => []]));
+        })->andReturn(Create::promiseFor(new Result(['Failed' => []])));
 
         $queue->flush();
     }
@@ -710,9 +712,9 @@ class QueueSqsQueueTest extends TestCase
         $queue->expects($this->exactly(2))->method('createPayload')->willReturn($this->mockedPayload);
         $queue->expects($this->exactly(2))->method('getQueue')->willReturn($this->queueUrl);
 
-        $this->sqs->shouldReceive('sendMessageBatch')->once()->withArgs(function ($args) {
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->withArgs(function ($args) {
             return $args['QueueUrl'] === $this->queueUrl && count($args['Entries']) === 2;
-        })->andReturn(new Result(['Failed' => []]));
+        })->andReturn(Create::promiseFor(new Result(['Failed' => []])));
 
         $queue->bulk([$this->mockedJob, $this->mockedJob], $this->mockedData, $this->queueName);
 
@@ -727,15 +729,18 @@ class QueueSqsQueueTest extends TestCase
         $queue->expects($this->exactly(2))->method('createPayload')->willReturn($this->mockedPayload);
         $queue->expects($this->exactly(3))->method('getQueue')->willReturn($this->queueUrl);
 
-        $this->sqs->shouldReceive('sendMessageBatch')->once()->andReturn(new Result([
-            'Failed' => [['Id' => 'abc', 'Code' => 'InternalError', 'SenderFault' => false, 'Message' => 'test']],
-        ]));
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->andReturn(
+            Create::promiseFor(new Result([
+                'Failed' => [['Id' => 'abc', 'Code' => 'InternalError', 'SenderFault' => false, 'Message' => 'test']],
+            ]))
+        );
 
         try {
             $queue->bulk([$this->mockedJob, $this->mockedJob], $this->mockedData, $this->queueName);
             $this->fail('Expected RuntimeException');
         } catch (\RuntimeException $e) {
-            $this->assertStringContainsString('Failed to send 1 message(s)', $e->getMessage());
+            $this->assertStringContainsString('Failed to send SQS message(s)', $e->getMessage());
+            $this->assertStringContainsString('abc', $e->getMessage());
         }
 
         // Batch flag must be restored even after exception, so pushRaw sends immediately
@@ -753,13 +758,61 @@ class QueueSqsQueueTest extends TestCase
         $queue->pushRaw('{"uuid":"msg-1"}', $this->queueUrl);
         $queue->pushRaw('{"uuid":"msg-2"}', $this->queueUrl);
 
-        $this->sqs->shouldReceive('sendMessageBatch')->once()->andReturn(new Result([
-            'Successful' => [['Id' => 'msg-1', 'MessageId' => 'aws-id-1']],
-            'Failed' => [['Id' => 'msg-2', 'Code' => 'InternalError', 'SenderFault' => false, 'Message' => 'Oops']],
-        ]));
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->andReturn(
+            Create::promiseFor(new Result([
+                'Successful' => [['Id' => 'msg-1', 'MessageId' => 'aws-id-1']],
+                'Failed' => [['Id' => 'msg-2', 'Code' => 'InternalError', 'SenderFault' => false, 'Message' => 'Oops']],
+            ]))
+        );
 
         $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessage('Failed to send 1 message(s)');
+        $this->expectExceptionMessage('Failed to send SQS message(s)');
+
+        $queue->flush();
+    }
+
+    public function testFlushThrowsOnRejectedPromise()
+    {
+        $queue = new SqsQueue($this->sqs, $this->queueName, $this->prefix, '', false, true);
+        $queue->setContainer($container = m::spy(Container::class));
+
+        $queue->pushRaw('{"uuid":"msg-1"}', $this->queueUrl);
+
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->andReturn(
+            new RejectedPromise(new \RuntimeException('Connection timed out'))
+        );
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Connection timed out');
+
+        $queue->flush();
+    }
+
+    public function testFlushAwaitsAutoFlushedPromises()
+    {
+        $queue = $this->getMockBuilder(SqsQueue::class)->onlyMethods(['createPayload', 'getQueue'])->setConstructorArgs([$this->sqs, $this->queueName, $this->account, '', false, true])->getMock();
+        $queue->setContainer($container = m::spy(Container::class));
+        $queue->expects($this->exactly(10))->method('createPayload')->willReturn($this->mockedPayload);
+        $queue->expects($this->exactly(10))->method('getQueue')->willReturn($this->queueUrl);
+
+        // Auto-flush fires async at 10 but the promise has a partial failure
+        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->andReturn(
+            Create::promiseFor(new Result([
+                'Failed' => [['Id' => 'bad-msg', 'Code' => 'InternalError', 'SenderFault' => false, 'Message' => 'fail']],
+            ]))
+        );
+
+        // Push 10 messages — triggers auto-flush (non-blocking)
+        for ($i = 0; $i < 10; $i++) {
+            $queue->push($this->mockedJob, $this->mockedData, $this->queueName);
+        }
+
+        // Buffer is empty but there's an in-flight promise with a failure
+        $this->assertEquals(0, $queue->pendingBatchCount());
+
+        // flush() awaits and surfaces the failure
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('bad-msg');
 
         $queue->flush();
     }
