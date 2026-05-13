@@ -26,6 +26,13 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
     const MAX_SQS_PAYLOAD_SIZE = 1048576;
 
     /**
+     * The maximum number of messages allowed per SendMessageBatch request.
+     *
+     * @var int
+     */
+    const MAX_MESSAGES_PER_BATCH = 10;
+
+    /**
      * The cache key prefix for extended SQS payloads.
      *
      * @var string
@@ -365,13 +372,6 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
 
         return array_filter($options);
     }
-
-    /**
-     * The maximum number of messages allowed per SendMessageBatch request.
-     *
-     * @var int
-     */
-    const MAX_MESSAGES_PER_BATCH = 10;
 
     /**
      * Push an array of jobs onto the queue using the SendMessageBatch API.
