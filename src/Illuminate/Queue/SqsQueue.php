@@ -3,12 +3,18 @@
 namespace Illuminate\Queue;
 
 use Aws\Sqs\SqsClient;
+use GuzzleHttp\Promise\Utils as GuzzlePromiseUtils;
+use Illuminate\Bus\DebounceLock;
+use Illuminate\Bus\UniqueLock;
+use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Illuminate\Contracts\Queue\ClearableQueue;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
+use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Queue\Jobs\SqsJob;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
+use RuntimeException;
 
 class SqsQueue extends Queue implements QueueContract, ClearableQueue
 {
@@ -361,7 +367,20 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
     }
 
     /**
-     * Push an array of jobs onto the queue.
+     * The maximum number of messages allowed per SendMessageBatch request.
+     *
+     * @var int
+     */
+    const MAX_MESSAGES_PER_BATCH = 10;
+
+    /**
+     * Push an array of jobs onto the queue using the SendMessageBatch API.
+     *
+     * Entries are chunked to respect the SQS per-batch limits of 10 messages
+     * and {@see static::MAX_SQS_PAYLOAD_SIZE} cumulative payload bytes, then
+     * each batch is dispatched concurrently. Per-job afterCommit, unique and
+     * debounce locks, delays, and JobQueueing / JobQueued events all behave
+     * identically to {@see static::push()}.
      *
      * @param  array  $jobs
      * @param  mixed  $data
@@ -370,13 +389,205 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      */
     public function bulk($jobs, $data = '', $queue = null)
     {
-        foreach ((array) $jobs as $job) {
-            if (isset($job->delay)) {
-                $this->later($job->delay, $job, $data, $queue);
+        $jobs = array_values((array) $jobs);
+
+        if ($jobs === []) {
+            return;
+        }
+
+        $queue = $this->getQueue($queue);
+
+        [$deferred, $immediate] = $this->partitionJobsByAfterCommit($jobs);
+
+        if ($deferred !== []) {
+            $transactions = $this->container->make('db.transactions');
+
+            foreach ($deferred as $job) {
+                $this->registerBulkRollbackCallbacks($job);
+            }
+
+            $transactions->addCallback(
+                fn () => $this->sendBatchedMessages($deferred, $data, $queue),
+            );
+        }
+
+        if ($immediate !== []) {
+            $this->sendBatchedMessages($immediate, $data, $queue);
+        }
+    }
+
+    /**
+     * Partition the given jobs into those that should be deferred until the
+     * active database transaction commits and those that should be dispatched
+     * immediately.
+     *
+     * @param  array  $jobs
+     * @return array{0: array, 1: array}
+     */
+    protected function partitionJobsByAfterCommit(array $jobs)
+    {
+        if (! $this->container->bound('db.transactions')) {
+            return [[], $jobs];
+        }
+
+        $deferred = $immediate = [];
+
+        foreach ($jobs as $job) {
+            if ($this->shouldDispatchAfterCommit($job)) {
+                $deferred[] = $job;
             } else {
-                $this->push($job, $data, $queue);
+                $immediate[] = $job;
             }
         }
+
+        return [$deferred, $immediate];
+    }
+
+    /**
+     * Register rollback callbacks so unique and debounce locks held by a
+     * deferred job are released if the transaction is rolled back.
+     *
+     * @param  mixed  $job
+     * @return void
+     */
+    protected function registerBulkRollbackCallbacks($job)
+    {
+        $transactions = $this->container->make('db.transactions');
+
+        if ($job instanceof ShouldBeUnique) {
+            $transactions->addCallbackForRollback(function () use ($job) {
+                (new UniqueLock($this->container->make(CacheRepository::class)))->release($job);
+            });
+        }
+
+        if (! empty($owner = $job->debounceOwner ?? '')) {
+            $transactions->addCallbackForRollback(function () use ($job, $owner) {
+                (new DebounceLock($this->container->make(CacheRepository::class)))->release($job, $owner);
+            });
+        }
+    }
+
+    /**
+     * Build entries for the given jobs, raise the queueing events, dispatch
+     * each chunk via SendMessageBatch concurrently, and then raise the queued
+     * events using the message IDs returned by SQS.
+     *
+     * @param  array  $jobs
+     * @param  mixed  $data
+     * @param  string  $queue
+     * @return void
+     *
+     * @throws \RuntimeException
+     */
+    protected function sendBatchedMessages(array $jobs, $data, $queue)
+    {
+        $entries = [];
+
+        foreach ($jobs as $job) {
+            $delay = is_object($job) ? ($job->delay ?? null) : null;
+
+            $payload = $this->createPayload($job, $queue, $data, $delay);
+
+            if ($this->willOverflow($payload)) {
+                $payload = $this->overflow($payload);
+            }
+
+            $entry = [
+                'Id' => (string) Str::uuid(),
+                'MessageBody' => $payload,
+            ];
+
+            $options = $this->getQueueableOptions($job, $queue, $payload, $delay);
+
+            foreach (['DelaySeconds', 'MessageGroupId', 'MessageDeduplicationId'] as $option) {
+                if (isset($options[$option])) {
+                    $entry[$option] = $options[$option];
+                }
+            }
+
+            $entries[] = compact('job', 'payload', 'delay', 'entry');
+
+            $this->raiseJobQueueingEvent($queue, $job, $payload, $delay);
+        }
+
+        $chunks = $this->chunkBatchEntries($entries);
+
+        $promises = array_map(fn ($chunk) => $this->sqs->sendMessageBatchAsync([
+            'QueueUrl' => $queue,
+            'Entries' => array_column($chunk, 'entry'),
+        ]), $chunks);
+
+        $responses = GuzzlePromiseUtils::all($promises)->wait();
+
+        $failures = [];
+
+        foreach ($responses as $index => $response) {
+            $indexedById = [];
+
+            foreach ($chunks[$index] as $item) {
+                $indexedById[$item['entry']['Id']] = $item;
+            }
+
+            foreach ($response['Successful'] ?? [] as $success) {
+                if (! isset($indexedById[$success['Id']])) {
+                    continue;
+                }
+
+                $item = $indexedById[$success['Id']];
+
+                $this->raiseJobQueuedEvent(
+                    $queue, $success['MessageId'], $item['job'], $item['payload'], $item['delay']
+                );
+            }
+
+            foreach ($response['Failed'] ?? [] as $failure) {
+                $failures[] = $failure;
+            }
+        }
+
+        if ($failures !== []) {
+            throw new RuntimeException(sprintf(
+                'SQS SendMessageBatch reported %d failed entries: %s',
+                count($failures),
+                json_encode($failures),
+            ));
+        }
+    }
+
+    /**
+     * Chunk batch entries respecting both the 10-message and cumulative
+     * payload-size limits enforced by SendMessageBatch.
+     *
+     * @param  array  $entries
+     * @return array
+     */
+    protected function chunkBatchEntries(array $entries)
+    {
+        $chunks = [];
+        $current = [];
+        $currentBytes = 0;
+
+        foreach ($entries as $item) {
+            $bytes = strlen($item['entry']['MessageBody']);
+
+            $wouldExceedCount = count($current) >= static::MAX_MESSAGES_PER_BATCH;
+            $wouldExceedBytes = $currentBytes + $bytes > static::MAX_SQS_PAYLOAD_SIZE;
+
+            if ($current !== [] && ($wouldExceedCount || $wouldExceedBytes)) {
+                $chunks[] = $current;
+                $current = [];
+                $currentBytes = 0;
+            }
+
+            $current[] = $item;
+            $currentBytes += $bytes;
+        }
+
+        if ($current !== []) {
+            $chunks[] = $current;
+        }
+
+        return $chunks;
     }
 
     /**
