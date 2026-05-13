@@ -391,7 +391,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
     {
         $jobs = array_values((array) $jobs);
 
-        if ($jobs === []) {
+        if (empty($jobs)) {
             return;
         }
 
@@ -399,7 +399,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
 
         [$deferred, $immediate] = $this->partitionJobsByAfterCommit($jobs);
 
-        if ($deferred !== []) {
+        if (! empty($deferred)) {
             $transactions = $this->container->make('db.transactions');
 
             foreach ($deferred as $job) {
@@ -411,7 +411,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
             );
         }
 
-        if ($immediate !== []) {
+        if (! empty($immediate)) {
             $this->sendBatchedMessages($immediate, $data, $queue);
         }
     }
@@ -545,7 +545,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
             }
         }
 
-        if ($failures !== []) {
+        if (! empty($failures)) {
             throw new RuntimeException(sprintf(
                 'SQS SendMessageBatch reported %d failed entries: %s',
                 count($failures),
@@ -573,7 +573,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
             $wouldExceedCount = count($current) >= static::MAX_MESSAGES_PER_BATCH;
             $wouldExceedBytes = $currentBytes + $bytes > static::MAX_SQS_PAYLOAD_SIZE;
 
-            if ($current !== [] && ($wouldExceedCount || $wouldExceedBytes)) {
+            if (! empty($current) && ($wouldExceedCount || $wouldExceedBytes)) {
                 $chunks[] = $current;
                 $current = [];
                 $currentBytes = 0;
@@ -583,7 +583,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
             $currentBytes += $bytes;
         }
 
-        if ($current !== []) {
+        if (! empty($current)) {
             $chunks[] = $current;
         }
 
