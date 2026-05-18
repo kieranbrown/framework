@@ -361,9 +361,12 @@ class Queue implements QueueContract, ClearableQueue
      */
     protected function normalizeQueue($queue)
     {
+        $prefix = $this->config['connection']['prefix'] ?? '';
+        $suffix = $this->config['connection']['suffix'] ?? '';
+
         return Str::of($this->queue->getQueue($queue))
-            ->chopStart($this->config['connection']['prefix'].'/')
-            ->chopEnd($this->config['connection']['suffix'])
+            ->chopStart($prefix === '' ? '' : $prefix.'/')
+            ->chopEnd($suffix)
             ->toString();
     }
 
