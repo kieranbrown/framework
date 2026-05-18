@@ -138,10 +138,18 @@ class Cloud
             return;
         }
 
-        $app['config']->set(
-            'queue.connections.cloud',
-            json_decode($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'], associative: true, flags: JSON_THROW_ON_ERROR),
-        );
+        $config = json_decode($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'], associative: true, flags: JSON_THROW_ON_ERROR);
+
+        $config['connection']['after_commit'] ??= env('CLOUD_QUEUE_AFTER_COMMIT', false);
+
+        $config['connection']['overflow'] ??= [
+            'enabled' => env('CLOUD_QUEUE_OVERFLOW_ENABLED', false),
+            'store' => env('CLOUD_QUEUE_OVERFLOW_STORE'),
+            'always' => env('CLOUD_QUEUE_OVERFLOW_ALWAYS', false),
+            'delete_after_processing' => env('CLOUD_QUEUE_OVERFLOW_DELETE_AFTER_PROCESSING', true),
+        ];
+
+        $app['config']->set('queue.connections.cloud', $config);
     }
 
     /**
