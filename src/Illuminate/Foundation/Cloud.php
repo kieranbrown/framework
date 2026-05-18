@@ -139,7 +139,7 @@ class Cloud
         }
 
         $app['config']->set(
-            'queue.connections.laravel-cloud',
+            'queue.connections.cloud',
             json_decode($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'], associative: true, flags: JSON_THROW_ON_ERROR),
         );
     }
@@ -156,13 +156,13 @@ class Cloud
         $app->singleton(Events::class, fn () => new Events(Cloud::socket()));
         $app->bind(QueueConnector::class, fn ($app) => new QueueConnector(new SqsConnector, $app));
 
-        $app['queue']->addConnector('laravel-cloud', $app->factory(QueueConnector::class));
+        $app['queue']->addConnector('cloud', $app->factory(QueueConnector::class));
 
         $failer = $app['queue.failer'];
         unset($app['queue.failer']);
 
         $app->singleton('queue.failer', fn ($app) => new FailedJobProvider(
-            $failer, $app[Events::class], $app['encrypter'], 'laravel-cloud',
+            $failer, $app[Events::class], $app['encrypter'], 'cloud',
         ));
     }
 
