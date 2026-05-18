@@ -243,7 +243,7 @@ class Queue implements QueueContract, ClearableQueue
     {
         $this->config = $config;
 
-        $this->queue->setConfig($config['config']);
+        $this->queue->setConfig($config['sqs']);
 
         return $this;
     }
@@ -362,8 +362,8 @@ class Queue implements QueueContract, ClearableQueue
     protected function normalizeQueue($queue)
     {
         return Str::of($this->queue->getQueue($queue))
-            ->chopStart($this->config['config']['prefix'].'/')
-            ->chopEnd($this->config['config']['suffix'])
+            ->chopStart($this->config['sqs']['prefix'].'/')
+            ->chopEnd($this->config['sqs']['suffix'])
             ->toString();
     }
 
