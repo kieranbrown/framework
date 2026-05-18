@@ -366,12 +366,12 @@ class Queue implements QueueContract, ClearableQueue
             return $queue ?? $this->config['connection']['queue'] ?? 'default';
         }
 
-        $prefix = $this->config['connection']['prefix'] ?? '';
-        $suffix = $this->config['connection']['suffix'] ?? '';
+        $prefix = $this->config['connection']['prefix'] ?? null;
+        $suffix = $this->config['connection']['suffix'] ?? null;
 
         return Str::of($this->queue->getQueue($queue))
-            ->when($prefix !== '', fn ($str) => $str->chopStart($prefix.'/'))
-            ->when($suffix !== '', fn ($str) => $str->chopEnd($suffix))
+            ->when($prefix, fn ($str) => $str->chopStart($prefix.'/'))
+            ->when($suffix, fn ($str) => $str->chopEnd($suffix))
             ->toString();
     }
 
