@@ -142,6 +142,13 @@ class Cloud
             'queue.connections.cloud',
             json_decode($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'], associative: true, flags: JSON_THROW_ON_ERROR),
         );
+
+        // Temporary backwards compatibility for apps still using the `sqs` connection directly.
+        $app['config']->set('queue.connections.sqs.credentials', 'ecs');
+
+        if (isset($_SERVER['LARAVEL_CLOUD_REGION'])) {
+            $app['config']->set('queue.connections.sqs.region', $_SERVER['LARAVEL_CLOUD_REGION']);
+        }
     }
 
     /**
