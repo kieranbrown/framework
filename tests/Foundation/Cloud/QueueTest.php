@@ -51,7 +51,8 @@ class QueueTest extends TestCase
     {
         Worker::$restartable = true;
         Worker::$pausable = true;
-        $_SERVER['LARAVEL_CLOUD'] = $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'] = '1';
+        $_SERVER['LARAVEL_CLOUD'] = '1';
+        $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'] = '{}';
 
         parent::setUp();
 
@@ -65,7 +66,7 @@ class QueueTest extends TestCase
     {
         parent::tearDown();
 
-        unset($_SERVER['LARAVEL_CLOUD'], $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'], $_SERVER['LARAVEL_CLOUD_REGION']);
+        unset($_SERVER['LARAVEL_CLOUD'], $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'], $_SERVER['LARAVEL_CLOUD_REGION']);
         Worker::$restartable = true;
         Worker::$pausable = true;
     }
@@ -113,7 +114,7 @@ class QueueTest extends TestCase
     #[WithConfig('queue.connections.sqs', ['driver' => 'sqs', 'region' => 'us-east-1', 'queue' => 'default'])]
     public function testItDoesNotConfigureManagedQueuesWhenNotEnabled()
     {
-        unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES']);
+        unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG']);
         Cloud::configureManagedQueues($this->app);
 
         $this->assertNull($this->app['config']->get('queue.connections.sqs.credentials'));
@@ -122,16 +123,11 @@ class QueueTest extends TestCase
     #[WithConfig('queue.connections.sqs', ['driver' => 'sqs', 'region' => 'us-east-1', 'queue' => 'default'])]
     public function testItConfiguresManagedQueueRegion()
     {
-        $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'] = '1';
         $_SERVER['LARAVEL_CLOUD_REGION'] = 'us-west-2';
 
-        try {
-            Cloud::configureManagedQueues($this->app);
+        Cloud::configureManagedQueues($this->app);
 
-            $this->assertEquals('us-west-2', $this->app['config']->get('queue.connections.sqs.region'));
-        } finally {
-            unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'], $_SERVER['LARAVEL_CLOUD_REGION']);
-        }
+        $this->assertEquals('us-west-2', $this->app['config']->get('queue.connections.sqs.region'));
     }
 
     public function testItSetSqsCredentialsToEcs()
@@ -188,7 +184,7 @@ class QueueTest extends TestCase
 
     public function testItDoesNotBindCloudQueueWhenManagedQueuesIsInactive()
     {
-        unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES']);
+        unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG']);
 
         Cloud::bootManagedQueues($this->app);
 

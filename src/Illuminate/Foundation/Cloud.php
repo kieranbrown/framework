@@ -138,10 +138,6 @@ class Cloud
             return;
         }
 
-        if (! isset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'])) {
-            return;
-        }
-
         $app['config']->set(
             'queue.connections.cloud',
             json_decode($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'], associative: true, flags: JSON_THROW_ON_ERROR),
@@ -209,6 +205,6 @@ class Cloud
      */
     protected static function managedQueuesAreActive(): bool
     {
-        return ($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'] ?? null) === '1';
+        return isset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG']);
     }
 }
