@@ -5,6 +5,7 @@ namespace Illuminate\Foundation\Cloud;
 use Carbon\CarbonImmutable;
 use Illuminate\Contracts\Queue\ClearableQueue;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
+use Illuminate\Queue\SqsQueue;
 use Illuminate\Support\Str;
 use Illuminate\Support\Traits\ForwardsCalls;
 
@@ -361,12 +362,16 @@ class Queue implements QueueContract, ClearableQueue
      */
     protected function normalizeQueue($queue)
     {
+        if (! $this->queue instanceof SqsQueue) {
+            return $queue ?? $this->config['connection']['queue'] ?? 'default';
+        }
+
         $prefix = $this->config['connection']['prefix'] ?? '';
         $suffix = $this->config['connection']['suffix'] ?? '';
 
         return Str::of($this->queue->getQueue($queue))
-            ->chopStart($prefix === '' ? '' : $prefix.'/')
-            ->chopEnd($suffix)
+            ->when($prefix !== '', fn ($str) => $str->chopStart($prefix.'/'))
+            ->when($suffix !== '', fn ($str) => $str->chopEnd($suffix))
             ->toString();
     }
 
