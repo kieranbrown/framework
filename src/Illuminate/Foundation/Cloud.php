@@ -166,7 +166,7 @@ class Cloud
         unset($app['queue.failer']);
 
         $app->singleton('queue.failer', fn ($app) => new FailedJobProvider(
-            $failer, $app[Events::class], $app['encrypter'], 'cloud',
+            $failer, $app[Events::class], $app['encrypter'],
         ));
     }
 

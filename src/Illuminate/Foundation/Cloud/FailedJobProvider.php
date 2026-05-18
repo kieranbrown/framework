@@ -36,7 +36,6 @@ class FailedJobProvider implements FailedJobProviderInterface, CountableFailedJo
         protected FailedJobProviderInterface $failer,
         protected Events $events,
         protected StringEncrypter $encrypter,
-        protected string $connection,
     ) {
         //
     }
@@ -52,7 +51,7 @@ class FailedJobProvider implements FailedJobProviderInterface, CountableFailedJo
      */
     public function log($connection, $queue, $payload, $exception)
     {
-        if ($this->connection !== $connection) {
+        if ($this->connection !== 'cloud') {
             return $this->failer->log(...func_get_args());
         }
 
