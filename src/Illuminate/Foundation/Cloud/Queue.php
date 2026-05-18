@@ -55,7 +55,7 @@ class Queue implements QueueContract, ClearableQueue
         protected Events $events,
         protected array $config,
     ) {
-        $this->prefix = $config['sqs']['prefix'].'/'
+        $this->prefix = $config['sqs']['prefix'].'/';
     }
 
     /**
