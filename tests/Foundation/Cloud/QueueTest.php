@@ -50,6 +50,7 @@ class QueueTest extends TestCase
         Worker::$restartable = true;
         Worker::$pausable = true;
         $_SERVER['LARAVEL_CLOUD'] = '1';
+        $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'] = '1';
         $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'] = json_encode([
             'driver' => 'cloud',
             'connection' => [
@@ -69,7 +70,7 @@ class QueueTest extends TestCase
     {
         parent::tearDown();
 
-        unset($_SERVER['LARAVEL_CLOUD'], $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG']);
+        unset($_SERVER['LARAVEL_CLOUD'], $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'], $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG']);
         Worker::$restartable = true;
         Worker::$pausable = true;
     }
@@ -160,7 +161,7 @@ class QueueTest extends TestCase
 
     public function testItDoesNotRegisterCloudConnectorWhenManagedQueuesIsInactive()
     {
-        unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG']);
+        unset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES']);
 
         Cloud::bootManagedQueues($this->app);
 
