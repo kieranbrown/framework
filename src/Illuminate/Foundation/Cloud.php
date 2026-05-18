@@ -134,7 +134,7 @@ class Cloud
      */
     public static function configureManagedQueues(Application $app): void
     {
-        if (! Cloud::managedQueuesAreActive()) {
+        if (! isset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'])) {
             return;
         }
 
@@ -149,7 +149,7 @@ class Cloud
      */
     public static function bootManagedQueues(Application $app): void
     {
-        if (! Cloud::managedQueuesAreActive()) {
+        if (($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES'] ?? '0') !== '1') {
             return;
         }
 
@@ -198,13 +198,5 @@ class Cloud
         return $_ENV['LARAVEL_CLOUD_LOG_SOCKET'] ??
             $_SERVER['LARAVEL_CLOUD_LOG_SOCKET'] ??
                 'unix:///tmp/cloud-init.sock';
-    }
-
-    /**
-     * Determine if managed queues are active.
-     */
-    protected static function managedQueuesAreActive(): bool
-    {
-        return isset($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG']);
     }
 }
