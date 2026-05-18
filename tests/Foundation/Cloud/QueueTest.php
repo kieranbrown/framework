@@ -52,12 +52,9 @@ class QueueTest extends TestCase
         $_SERVER['LARAVEL_CLOUD'] = '1';
         $_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'] = json_encode([
             'driver' => 'cloud',
-            'sqs' => [
-                'driver' => 'sqs',
-                'prefix' => 'https://sqs.us-east-2.amazonaws.com/1234567',
-                'suffix' => '-env-8280cf2c-2081-47e8-a1f1-9cdfcba8618f',
-                'queue' => 'default',
-            ],
+            'prefix' => 'https://sqs.us-east-2.amazonaws.com/1234567',
+            'suffix' => '-env-8280cf2c-2081-47e8-a1f1-9cdfcba8618f',
+            'queue' => 'default',
         ]);
 
         parent::setUp();
@@ -635,7 +632,7 @@ class QueueTest extends TestCase
         Cloud::configureManagedQueues($this->app);
         Cloud::bootManagedQueues($this->app);
         $eventsFake = $this->fakeEvents();
-        $this->app['config']->set('queue.connections.cloud.sqs.after_commit', true);
+        $this->app['config']->set('queue.connections.cloud.after_commit', true);
         [$queue, $client] = $this->mockedQueue();
         $client->shouldReceive('sendMessage')->times(7)->andReturn(new Result());
 
@@ -953,7 +950,7 @@ class QueueTest extends TestCase
             {
                 $queue ??= 'default';
 
-                return config('queue.connections.cloud.sqs.prefix').'/'.$queue.config('queue.connections.cloud.sqs.suffix');
+                return config('queue.connections.cloud.prefix').'/'.$queue.config('queue.connections.cloud.suffix');
             }
 
             public function setConfig(array $config)
