@@ -55,6 +55,7 @@ class QueueTest extends TestCase
             'driver' => 'cloud',
             'connection' => [
                 'driver' => 'sqs',
+                'region' => 'us-east-2',
                 'prefix' => 'https://sqs.us-east-2.amazonaws.com/1234567',
                 'suffix' => '-env-8280cf2c-2081-47e8-a1f1-9cdfcba8618f',
                 'queue' => 'default',
@@ -113,8 +114,17 @@ class QueueTest extends TestCase
 
         Cloud::configureManagedQueues($this->app);
 
+        $expected = json_decode($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'], true);
+        $expected['connection']['after_commit'] = false;
+        $expected['connection']['overflow'] = [
+            'enabled' => false,
+            'store' => null,
+            'always' => false,
+            'delete_after_processing' => true,
+        ];
+
         $this->assertSame(
-            json_decode($_SERVER['LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG'], true),
+            $expected,
             $this->app['config']->get('queue.connections.cloud'),
         );
     }
