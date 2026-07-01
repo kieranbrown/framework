@@ -4,17 +4,13 @@ namespace Illuminate\Queue;
 
 use Aws\Sqs\SqsClient;
 use GuzzleHttp\Promise\Utils as GuzzlePromiseUtils;
-use Illuminate\Bus\DebounceLock;
-use Illuminate\Bus\UniqueLock;
-use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Illuminate\Contracts\Queue\ClearableQueue;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
-use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Queue\Jobs\SqsJob;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
-use RuntimeException;
+use Throwable;
 
 class SqsQueue extends Queue implements QueueContract, ClearableQueue
 {
@@ -377,10 +373,11 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      * Push an array of jobs onto the queue using the SendMessageBatch API.
      *
      * Entries are chunked to respect the SQS per-batch limits of 10 messages
-     * and {@see static::MAX_SQS_PAYLOAD_SIZE} cumulative payload bytes, then
-     * each batch is dispatched concurrently. Per-job afterCommit, unique and
-     * debounce locks, delays, and JobQueueing / JobQueued events all behave
-     * identically to {@see static::push()}.
+     * and {@see static::MAX_SQS_PAYLOAD_SIZE} cumulative payload bytes. The
+     * batches are dispatched concurrently for standard queues and one at a
+     * time for FIFO queues to preserve ordering. Per-job afterCommit, unique
+     * and debounce locks, delays, and JobQueueing / JobQueued events all
+     * behave identically to {@see static::push()}.
      *
      * @param  array  $jobs
      * @param  mixed  $data
@@ -395,24 +392,22 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
             return;
         }
 
-        $queue = $this->getQueue($queue);
-
         [$deferred, $immediate] = $this->partitionJobsByAfterCommit($jobs);
 
         if (! empty($deferred)) {
-            $transactions = $this->container->make('db.transactions');
-
             foreach ($deferred as $job) {
-                $this->registerBulkRollbackCallbacks($job);
+                $this->registerRollbackCallbacksForDeferredJob($job);
             }
 
-            $transactions->addCallback(
-                fn () => $this->sendBatchedMessages($deferred, $data, $queue),
+            $messages = $this->createBatchMessages($deferred, $data, $queue);
+
+            $this->container->make('db.transactions')->addCallback(
+                fn () => $this->sendBatchedMessages($messages, $queue),
             );
         }
 
         if (! empty($immediate)) {
-            $this->sendBatchedMessages($immediate, $data, $queue);
+            $this->sendBatchedMessages($this->createBatchMessages($immediate, $data, $queue), $queue);
         }
     }
 
@@ -444,91 +439,150 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
     }
 
     /**
-     * Register rollback callbacks so unique and debounce locks held by a
-     * deferred job are released if the transaction is rolled back.
+     * Create the payload for each of the given jobs.
      *
-     * @param  mixed  $job
-     * @return void
-     */
-    protected function registerBulkRollbackCallbacks($job)
-    {
-        $transactions = $this->container->make('db.transactions');
-
-        if ($job instanceof ShouldBeUnique) {
-            $transactions->addCallbackForRollback(function () use ($job) {
-                (new UniqueLock($this->container->make(CacheRepository::class)))->release($job);
-            });
-        }
-
-        if (! empty($owner = $job->debounceOwner ?? '')) {
-            $transactions->addCallbackForRollback(function () use ($job, $owner) {
-                (new DebounceLock($this->container->make(CacheRepository::class)))->release($job, $owner);
-            });
-        }
-    }
-
-    /**
-     * Build entries for the given jobs, raise the queueing events, dispatch
-     * each chunk via SendMessageBatch concurrently, and then raise the queued
-     * events using the message IDs returned by SQS.
+     * Payloads are created at dispatch time, even for jobs deferred until
+     * after the transaction commits, mirroring {@see static::push()}.
      *
      * @param  array  $jobs
      * @param  mixed  $data
-     * @param  string  $queue
+     * @param  string|null  $queue
+     * @return array<int, array{job: mixed, delay: mixed, payload: string}>
+     */
+    protected function createBatchMessages(array $jobs, $data, $queue)
+    {
+        return array_map(function ($job) use ($data, $queue) {
+            $delay = is_object($job) ? ($job->delay ?? null) : null;
+
+            return [
+                'job' => $job,
+                'delay' => $delay,
+                'payload' => $this->createPayload($job, $queue ?: $this->default, $data, $delay),
+            ];
+        }, $jobs);
+    }
+
+    /**
+     * Build entries for the given messages, raise the queueing events,
+     * dispatch each chunk via SendMessageBatch, and then raise the queued
+     * events using the message IDs returned by SQS.
+     *
+     * @param  array  $messages
+     * @param  string|null  $queue
      * @return void
      *
-     * @throws \RuntimeException
+     * @throws \Illuminate\Queue\SqsBulkDispatchException
+     * @throws \Throwable
      */
-    protected function sendBatchedMessages(array $jobs, $data, $queue)
+    protected function sendBatchedMessages(array $messages, $queue)
     {
         $entries = [];
 
-        foreach ($jobs as $job) {
-            $delay = is_object($job) ? ($job->delay ?? null) : null;
-
-            $payload = $this->createPayload($job, $queue, $data, $delay);
-
-            if ($this->willOverflow($payload)) {
-                $payload = $this->overflow($payload);
-            }
-
-            $entry = [
-                'Id' => (string) Str::uuid(),
-                'MessageBody' => $payload,
-            ];
+        foreach ($messages as $index => $message) {
+            ['job' => $job, 'delay' => $delay, 'payload' => $payload] = $message;
 
             $options = $this->getQueueableOptions($job, $queue, $payload, $delay);
 
-            foreach (['DelaySeconds', 'MessageGroupId', 'MessageDeduplicationId'] as $option) {
-                if (isset($options[$option])) {
-                    $entry[$option] = $options[$option];
-                }
-            }
-
-            $entries[] = compact('job', 'payload', 'delay', 'entry');
-
             $this->raiseJobQueueingEvent($queue, $job, $payload, $delay);
+
+            $entries[] = [
+                ...$message,
+                'entry' => [
+                    'Id' => (string) $index,
+                    'MessageBody' => $this->willOverflow($payload) ? $this->overflow($payload) : $payload,
+                    ...$options,
+                ],
+            ];
         }
 
         $chunks = $this->chunkBatchEntries($entries);
 
-        $promises = array_map(fn ($chunk) => $this->sqs->sendMessageBatchAsync([
-            'QueueUrl' => $queue,
+        $queueUrl = $this->getQueue($queue);
+
+        $responses = str_ends_with($queueUrl, '.fifo')
+            ? $this->sendBatchesSequentially($chunks, $queueUrl)
+            : $this->sendBatchesConcurrently($chunks, $queueUrl);
+
+        [$failed, $exceptions] = $this->processBatchResponses($chunks, $responses, $queue);
+
+        if (count($chunks) === 1 && ! empty($exceptions)) {
+            throw $exceptions[0];
+        }
+
+        if (! empty($failed) || ! empty($exceptions)) {
+            throw new SqsBulkDispatchException($failed, $exceptions);
+        }
+    }
+
+    /**
+     * Send the given chunks concurrently, waiting for every request to settle.
+     *
+     * @param  array  $chunks
+     * @param  string  $queueUrl
+     * @return array<int, array{state: string, value?: \Aws\Result, reason?: \Throwable}>
+     */
+    protected function sendBatchesConcurrently(array $chunks, $queueUrl)
+    {
+        return GuzzlePromiseUtils::settle(array_map(fn ($chunk) => $this->sqs->sendMessageBatchAsync([
+            'QueueUrl' => $queueUrl,
             'Entries' => array_column($chunk, 'entry'),
-        ]), $chunks);
+        ]), $chunks))->wait();
+    }
 
-        $responses = GuzzlePromiseUtils::all($promises)->wait();
+    /**
+     * Send the given chunks one at a time to preserve FIFO ordering, aborting
+     * on the first failed request so later messages cannot arrive earlier.
+     *
+     * @param  array  $chunks
+     * @param  string  $queueUrl
+     * @return array<int, array{state: string, value?: \Aws\Result, reason?: \Throwable}>
+     */
+    protected function sendBatchesSequentially(array $chunks, $queueUrl)
+    {
+        $responses = [];
 
-        $failures = [];
+        foreach ($chunks as $chunk) {
+            try {
+                $responses[] = ['state' => 'fulfilled', 'value' => $this->sqs->sendMessageBatch([
+                    'QueueUrl' => $queueUrl,
+                    'Entries' => array_column($chunk, 'entry'),
+                ])];
+            } catch (Throwable $e) {
+                $responses[] = ['state' => 'rejected', 'reason' => $e];
+
+                break;
+            }
+        }
+
+        return $responses;
+    }
+
+    /**
+     * Raise queued events for each successful entry and collect the failures.
+     *
+     * @param  array  $chunks
+     * @param  array  $responses
+     * @param  string|null  $queue
+     * @return array{0: array, 1: array<int, \Throwable>}
+     */
+    protected function processBatchResponses(array $chunks, array $responses, $queue)
+    {
+        $failed = $exceptions = [];
 
         foreach ($responses as $index => $response) {
+            if ($response['state'] === 'rejected') {
+                $exceptions[] = $response['reason'];
+
+                continue;
+            }
+
             $indexedById = [];
 
             foreach ($chunks[$index] as $item) {
                 $indexedById[$item['entry']['Id']] = $item;
             }
 
-            foreach ($response['Successful'] ?? [] as $success) {
+            foreach ($response['value']['Successful'] ?? [] as $success) {
                 if (! isset($indexedById[$success['Id']])) {
                     continue;
                 }
@@ -540,18 +594,16 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
                 );
             }
 
-            foreach ($response['Failed'] ?? [] as $failure) {
-                $failures[] = $failure;
+            foreach ($response['value']['Failed'] ?? [] as $failure) {
+                $failed[] = [
+                    'job' => $indexedById[$failure['Id']]['job'] ?? null,
+                    'code' => $failure['Code'] ?? null,
+                    'message' => $failure['Message'] ?? null,
+                ];
             }
         }
 
-        if (! empty($failures)) {
-            throw new RuntimeException(sprintf(
-                'SQS SendMessageBatch reported %d failed entries: %s',
-                count($failures),
-                json_encode($failures),
-            ));
-        }
+        return [$failed, $exceptions];
     }
 
     /**
