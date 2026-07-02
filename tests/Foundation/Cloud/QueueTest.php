@@ -388,7 +388,10 @@ class QueueTest extends TestCase
         $eventsFake = $this->fakeEvents();
         $client = $this->fakeConnector();
         $queue = $this->app['queue']->connection('sqs');
-        $client->shouldReceive('sendMessage')->times(7)->andReturn(new Result());
+        $client->shouldReceive('sendMessage')->times(5)->andReturn(new Result());
+        $client->shouldReceive('sendMessageBatch')->once()->andReturnUsing(fn ($args) => new Result([
+            'Successful' => array_map(fn ($entry) => ['Id' => $entry['Id'], 'MessageId' => 'id'], $args['Entries']),
+        ]));
 
         $queue->push(new FakeJob, queue: '1');
         $queue->pushOn('2', new FakeJob);
@@ -452,7 +455,10 @@ class QueueTest extends TestCase
         $client = $this->fakeConnector();
         $this->app['config']->set('queue.connections.sqs.after_commit', true);
         $queue = $this->app['queue']->connection('sqs');
-        $client->shouldReceive('sendMessage')->times(7)->andReturn(new Result());
+        $client->shouldReceive('sendMessage')->times(5)->andReturn(new Result());
+        $client->shouldReceive('sendMessageBatch')->once()->andReturnUsing(fn ($args) => new Result([
+            'Successful' => array_map(fn ($entry) => ['Id' => $entry['Id'], 'MessageId' => 'id'], $args['Entries']),
+        ]));
 
         DB::beginTransaction();
 
