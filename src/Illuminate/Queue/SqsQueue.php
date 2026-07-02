@@ -3,16 +3,13 @@
 namespace Illuminate\Queue;
 
 use Aws\Sqs\SqsClient;
-use GuzzleHttp\Promise\Create as GuzzlePromiseCreate;
-use GuzzleHttp\Promise\Each as GuzzlePromiseEach;
-use GuzzleHttp\Promise\PromiseInterface;
 use Illuminate\Contracts\Queue\ClearableQueue;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Jobs\SqsJob;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
-use Throwable;
+use RuntimeException;
 
 class SqsQueue extends Queue implements QueueContract, ClearableQueue
 {
@@ -29,13 +26,6 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      * @var int
      */
     const MAX_MESSAGES_PER_BATCH = 10;
-
-    /**
-     * The maximum number of SendMessageBatch requests to keep in flight at once.
-     *
-     * @var int
-     */
-    const MAX_CONCURRENT_BATCHES = 25;
 
     /**
      * The cache key prefix for extended SQS payloads.
@@ -382,11 +372,12 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      * Push an array of jobs onto the queue using the SendMessageBatch API.
      *
      * Entries are chunked to respect the SQS per-batch limits of 10 messages
-     * and {@see static::MAX_SQS_PAYLOAD_SIZE} cumulative payload bytes. The
-     * batches are dispatched concurrently for standard queues and one at a
-     * time for FIFO queues to preserve ordering. Per-job afterCommit, unique
-     * and debounce locks, delays, and JobQueueing / JobQueued events all
-     * behave identically to {@see static::push()}.
+     * and {@see static::MAX_SQS_PAYLOAD_SIZE} cumulative payload bytes, then
+     * each chunk is dispatched sequentially. FIFO queues stop at the first
+     * failure to preserve ordering, while standard queues attempt every chunk
+     * and aggregate any failures. Per-job afterCommit, unique and debounce
+     * locks, delays, and JobQueueing / JobQueued events all behave identically
+     * to {@see static::push()}.
      *
      * @param  array  $jobs
      * @param  mixed  $data
@@ -480,7 +471,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      * @param  string|null  $queue
      * @return void
      *
-     * @throws \Illuminate\Queue\SqsBulkDispatchException
+     * @throws \RuntimeException
      * @throws \Throwable
      */
     protected function sendBatchedMessages(array $messages, $queue)
@@ -495,23 +486,45 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
 
         $queueUrl = $this->getQueue($queue);
 
-        $requests = array_map(fn ($chunk) => [
-            'QueueUrl' => $queueUrl,
-            'Entries' => $chunk,
-        ], $this->chunkBatchEntries($entries));
+        // Chunks are dispatched one at a time and we stop at the first failure,
+        // mirroring push(): jobs already sent stay queued, later chunks are not
+        // attempted, and the error surfaces to the caller. Stopping also keeps
+        // FIFO ordering intact, since no later message can arrive ahead of one
+        // that was never sent.
+        foreach ($this->chunkBatchEntries($entries) as $chunk) {
+            // Request-level errors (throttling, auth, networking) throw an
+            // SqsException here, which we allow to propagate untouched.
+            $result = $this->sqs->sendMessageBatch([
+                'QueueUrl' => $queueUrl,
+                'Entries' => $chunk,
+            ]);
 
-        $responses = str_ends_with($queueUrl, '.fifo')
-            ? $this->sendBatchesSequentially($requests)
-            : $this->sendBatchesConcurrently($requests);
+            foreach ($result['Successful'] ?? [] as $success) {
+                if (! isset($messages[$success['Id']])) {
+                    continue;
+                }
 
-        [$failed, $exceptions] = $this->processBatchResponses($responses, $messages, $queue);
+                $message = $messages[$success['Id']];
 
-        if (count($requests) === 1 && ! empty($exceptions)) {
-            throw $exceptions[0];
-        }
+                $this->raiseJobQueuedEvent(
+                    $queue, $success['MessageId'], $message['job'], $message['payload'], $message['delay']
+                );
+            }
 
-        if (! empty($failed) || ! empty($exceptions)) {
-            throw new SqsBulkDispatchException($failed, $exceptions);
+            // A batch can return HTTP 200 while still rejecting individual
+            // entries, which does not raise an SqsException. Surface those so
+            // the rejected jobs are not silently dropped.
+            if (! empty($result['Failed'])) {
+                $failure = $result['Failed'][0];
+
+                throw new RuntimeException(sprintf(
+                    'SQS SendMessageBatch rejected [%d] of [%d] messages. First failure [%s]: %s',
+                    count($result['Failed']),
+                    count($chunk),
+                    $failure['Code'] ?? 'Unknown',
+                    $failure['Message'] ?? '',
+                ));
+            }
         }
     }
 
@@ -535,116 +548,6 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
             'MessageBody' => $this->willOverflow($payload) ? $this->overflow($payload) : $payload,
             ...$this->getQueueableOptions($job, $queue, $payload, $delay),
         ];
-    }
-
-    /**
-     * Send the given batch requests concurrently, waiting for every request to
-     * settle while keeping at most {@see static::MAX_CONCURRENT_BATCHES} in flight.
-     *
-     * @param  array  $requests
-     * @return array<int, array{state: string, value?: \Aws\Result, reason?: \Throwable}>
-     */
-    protected function sendBatchesConcurrently(array $requests)
-    {
-        $responses = [];
-
-        GuzzlePromiseEach::ofLimit(
-            (function () use ($requests) {
-                foreach ($requests as $index => $request) {
-                    try {
-                        yield $index => $this->sqs->sendMessageBatchAsync($request);
-                    } catch (Throwable $e) {
-                        yield $index => GuzzlePromiseCreate::rejectionFor($e);
-                    }
-                }
-            })(),
-            static::MAX_CONCURRENT_BATCHES,
-            function ($value, $index) use (&$responses) {
-                $responses[$index] = ['state' => PromiseInterface::FULFILLED, 'value' => $value];
-            },
-            function ($reason, $index) use (&$responses) {
-                $responses[$index] = ['state' => PromiseInterface::REJECTED, 'reason' => $reason];
-            }
-        )->wait();
-
-        ksort($responses);
-
-        return $responses;
-    }
-
-    /**
-     * Send the given batch requests one at a time to preserve FIFO ordering,
-     * aborting on the first failure so later messages cannot arrive earlier.
-     *
-     * @param  array  $requests
-     * @return array<int, array{state: string, value?: \Aws\Result, reason?: \Throwable}>
-     */
-    protected function sendBatchesSequentially(array $requests)
-    {
-        $responses = [];
-
-        foreach ($requests as $request) {
-            try {
-                $result = $this->sqs->sendMessageBatch($request);
-            } catch (Throwable $e) {
-                $responses[] = ['state' => PromiseInterface::REJECTED, 'reason' => $e];
-
-                break;
-            }
-
-            $responses[] = ['state' => PromiseInterface::FULFILLED, 'value' => $result];
-
-            // A batch may return HTTP 200 while still reporting per-entry failures.
-            // Stop here so later chunks cannot arrive ahead of the failed message.
-            if (! empty($result['Failed'])) {
-                break;
-            }
-        }
-
-        return $responses;
-    }
-
-    /**
-     * Raise queued events for each successful entry and collect the failures.
-     *
-     * @param  array  $responses
-     * @param  array  $messages
-     * @param  string|null  $queue
-     * @return array{0: array, 1: array<int, \Throwable>}
-     */
-    protected function processBatchResponses(array $responses, array $messages, $queue)
-    {
-        $failed = $exceptions = [];
-
-        foreach ($responses as $response) {
-            if ($response['state'] === PromiseInterface::REJECTED) {
-                $exceptions[] = $response['reason'];
-
-                continue;
-            }
-
-            foreach ($response['value']['Successful'] ?? [] as $success) {
-                if (! isset($messages[$success['Id']])) {
-                    continue;
-                }
-
-                $message = $messages[$success['Id']];
-
-                $this->raiseJobQueuedEvent(
-                    $queue, $success['MessageId'], $message['job'], $message['payload'], $message['delay']
-                );
-            }
-
-            foreach ($response['value']['Failed'] ?? [] as $failure) {
-                $failed[] = [
-                    'job' => $messages[$failure['Id']]['job'] ?? null,
-                    'code' => $failure['Code'] ?? null,
-                    'message' => $failure['Message'] ?? null,
-                ];
-            }
-        }
-
-        return [$failed, $exceptions];
     }
 
     /**

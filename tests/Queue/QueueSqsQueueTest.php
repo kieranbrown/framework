@@ -4,7 +4,6 @@ namespace Illuminate\Tests\Queue;
 
 use Aws\Result;
 use Aws\Sqs\SqsClient;
-use GuzzleHttp\Promise\Create as PromiseCreate;
 use Illuminate\Bus\Dispatcher;
 use Illuminate\Container\Container;
 use Illuminate\Contracts\Bus\Dispatcher as DispatcherContract;
@@ -15,7 +14,6 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Queue\Jobs\SqsJob;
 use Illuminate\Queue\QueueRoutes;
-use Illuminate\Queue\SqsBulkDispatchException;
 use Illuminate\Queue\SqsQueue;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
@@ -812,16 +810,16 @@ class QueueSqsQueueTest extends TestCase
 
         $captured = null;
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->with(m::on(function ($args) use (&$captured) {
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->with(m::on(function ($args) use (&$captured) {
             $captured = $args;
 
             return true;
-        }))->andReturn(PromiseCreate::promiseFor(new Result([
+        }))->andReturn(new Result([
             'Successful' => [
                 ['Id' => 'placeholder', 'MessageId' => 'mid-1'],
             ],
             'Failed' => [],
-        ])));
+        ]));
 
         $queue->bulk(['a', 'b', 'c'], 'data', $this->queueName);
 
@@ -842,11 +840,11 @@ class QueueSqsQueueTest extends TestCase
 
         $batchSizes = [];
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->twice()->with(m::on(function ($args) use (&$batchSizes) {
+        $this->sqs->shouldReceive('sendMessageBatch')->twice()->with(m::on(function ($args) use (&$batchSizes) {
             $batchSizes[] = count($args['Entries']);
 
             return true;
-        }))->andReturn(PromiseCreate::promiseFor(new Result(['Successful' => [], 'Failed' => []])));
+        }))->andReturn(new Result(['Successful' => [], 'Failed' => []]));
 
         $queue->bulk(range(1, 15), 'data', $this->queueName);
 
@@ -867,11 +865,11 @@ class QueueSqsQueueTest extends TestCase
 
         $batchSizes = [];
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->twice()->with(m::on(function ($args) use (&$batchSizes) {
+        $this->sqs->shouldReceive('sendMessageBatch')->twice()->with(m::on(function ($args) use (&$batchSizes) {
             $batchSizes[] = count($args['Entries']);
 
             return true;
-        }))->andReturn(PromiseCreate::promiseFor(new Result(['Successful' => [], 'Failed' => []])));
+        }))->andReturn(new Result(['Successful' => [], 'Failed' => []]));
 
         $queue->bulk(['a', 'b'], 'data', $this->queueName);
 
@@ -900,14 +898,14 @@ class QueueSqsQueueTest extends TestCase
         $queue->expects($this->once())->method('getQueue')->willReturn($this->queueUrl);
         $queue->method('createPayload')->willReturnCallback(fn ($job) => "payload-{$job}");
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->andReturnUsing(function ($args) {
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->andReturnUsing(function ($args) {
             $successful = array_map(
                 fn ($entry, $i) => ['Id' => $entry['Id'], 'MessageId' => 'mid-'.$i],
                 $args['Entries'],
                 array_keys($args['Entries'])
             );
 
-            return PromiseCreate::promiseFor(new Result(['Successful' => $successful, 'Failed' => []]));
+            return new Result(['Successful' => $successful, 'Failed' => []]);
         });
 
         $queue->bulk(['a', 'b'], 'data', $this->queueName);
@@ -938,11 +936,11 @@ class QueueSqsQueueTest extends TestCase
 
         $captured = null;
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->with(m::on(function ($args) use (&$captured) {
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->with(m::on(function ($args) use (&$captured) {
             $captured = $args;
 
             return true;
-        }))->andReturn(PromiseCreate::promiseFor(new Result(['Successful' => [], 'Failed' => []])));
+        }))->andReturn(new Result(['Successful' => [], 'Failed' => []]));
 
         $queue->bulk([$jobA, $jobB], 'data', $this->queueName);
 
@@ -960,25 +958,24 @@ class QueueSqsQueueTest extends TestCase
         $queue->expects($this->once())->method('getQueue')->willReturn($this->queueUrl);
         $queue->expects($this->once())->method('createPayload')->willReturn('payload-a');
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->andReturnUsing(function ($args) {
-            return PromiseCreate::promiseFor(new Result([
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->andReturnUsing(function ($args) {
+            return new Result([
                 'Successful' => [],
                 'Failed' => [
                     ['Id' => $args['Entries'][0]['Id'], 'Code' => 'InternalError', 'Message' => 'oops', 'SenderFault' => false],
                 ],
-            ]));
+            ]);
         });
 
         try {
             $queue->bulk(['a'], 'data', $this->queueName);
 
-            $this->fail('SqsBulkDispatchException was not thrown.');
-        } catch (SqsBulkDispatchException $e) {
-            $this->assertStringContainsString('[1] entries were rejected', $e->getMessage());
-            $this->assertSame('a', $e->failedJobs[0]['job']);
-            $this->assertSame('InternalError', $e->failedJobs[0]['code']);
-            $this->assertSame('oops', $e->failedJobs[0]['message']);
-            $this->assertSame([], $e->exceptions);
+            $this->fail('RuntimeException was not thrown.');
+        } catch (RuntimeException $e) {
+            $this->assertSame(
+                'SQS SendMessageBatch rejected [1] of [1] messages. First failure [InternalError]: oops',
+                $e->getMessage()
+            );
         }
     }
 
@@ -1018,18 +1015,14 @@ class QueueSqsQueueTest extends TestCase
         $queue->expects($this->once())->method('getQueue')->willReturn($this->fifoQueueUrl);
         $queue->method('createPayload')->willReturnCallback(fn ($job) => "payload-{$job}");
 
+        // Only the first of the two chunks is attempted; the exception from
+        // that request propagates untouched and later chunks are not sent.
         $this->sqs->shouldReceive('sendMessageBatch')->once()->andThrow(new RuntimeException('SQS is down'));
 
-        try {
-            $queue->bulk(range(1, 15), 'data', $this->fifoQueueName);
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('SQS is down');
 
-            $this->fail('SqsBulkDispatchException was not thrown.');
-        } catch (SqsBulkDispatchException $e) {
-            $this->assertSame([], $e->failedJobs);
-            $this->assertCount(1, $e->exceptions);
-            $this->assertSame('SQS is down', $e->exceptions[0]->getMessage());
-            $this->assertSame($e->exceptions[0], $e->getPrevious());
-        }
+        $queue->bulk(range(1, 15), 'data', $this->fifoQueueName);
     }
 
     public function testBulkDefersAfterCommitJobsUntilTheTransactionCommits()
@@ -1060,10 +1053,10 @@ class QueueSqsQueueTest extends TestCase
 
         $sent = false;
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->andReturnUsing(function () use (&$sent) {
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->andReturnUsing(function () use (&$sent) {
             $sent = true;
 
-            return PromiseCreate::promiseFor(new Result(['Successful' => [], 'Failed' => []]));
+            return new Result(['Successful' => [], 'Failed' => []]);
         });
 
         $queue->bulk([$job], 'data', $this->queueName);
@@ -1167,30 +1160,31 @@ class QueueSqsQueueTest extends TestCase
 
         $calls = 0;
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->twice()->andReturnUsing(function ($args) use (&$calls) {
+        $this->sqs->shouldReceive('sendMessageBatch')->twice()->andReturnUsing(function ($args) use (&$calls) {
             if ($calls++ === 0) {
-                return PromiseCreate::promiseFor(new Result([
+                return new Result([
                     'Successful' => array_map(
                         fn ($entry, $i) => ['Id' => $entry['Id'], 'MessageId' => 'mid-'.$i],
                         $args['Entries'],
                         array_keys($args['Entries'])
                     ),
                     'Failed' => [],
-                ]));
+                ]);
             }
 
-            return PromiseCreate::rejectionFor(new RuntimeException('chunk failed'));
+            throw new RuntimeException('chunk failed');
         });
 
         try {
             $queue->bulk(range(1, 15), 'data', $this->queueName);
 
-            $this->fail('SqsBulkDispatchException was not thrown.');
-        } catch (SqsBulkDispatchException $e) {
-            $this->assertCount(1, $e->exceptions);
-            $this->assertSame('chunk failed', $e->exceptions[0]->getMessage());
+            $this->fail('RuntimeException was not thrown.');
+        } catch (RuntimeException $e) {
+            $this->assertSame('chunk failed', $e->getMessage());
         }
 
+        // The first chunk was queued before the second failed, so its queued
+        // events must already have fired.
         $queuedEvents = array_filter($dispatched, fn ($e) => $e instanceof \Illuminate\Queue\Events\JobQueued);
 
         $this->assertCount(10, $queuedEvents);
@@ -1206,9 +1200,7 @@ class QueueSqsQueueTest extends TestCase
         $queue->expects($this->once())->method('getQueue')->willReturn($this->queueUrl);
         $queue->expects($this->once())->method('createPayload')->willReturn('payload-a');
 
-        $this->sqs->shouldReceive('sendMessageBatchAsync')->once()->andReturn(
-            PromiseCreate::rejectionFor(new RuntimeException('SQS is down'))
-        );
+        $this->sqs->shouldReceive('sendMessageBatch')->once()->andThrow(new RuntimeException('SQS is down'));
 
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('SQS is down');
@@ -1221,7 +1213,7 @@ class QueueSqsQueueTest extends TestCase
         $queue = new SqsQueue($this->sqs, $this->queueName, $this->account);
         $queue->setContainer(m::mock(Container::class));
 
-        $this->sqs->shouldNotReceive('sendMessageBatchAsync');
+        $this->sqs->shouldNotReceive('sendMessageBatch');
 
         $queue->bulk([], 'data', $this->queueName);
     }
