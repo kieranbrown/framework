@@ -3,6 +3,7 @@
 namespace Illuminate\Tests\Queue;
 
 use Aws\Result;
+use Aws\Sqs\Exception\SqsException;
 use Aws\Sqs\SqsClient;
 use Illuminate\Bus\Dispatcher;
 use Illuminate\Container\Container;
@@ -970,12 +971,15 @@ class QueueSqsQueueTest extends TestCase
         try {
             $queue->bulk(['a'], 'data', $this->queueName);
 
-            $this->fail('RuntimeException was not thrown.');
-        } catch (RuntimeException $e) {
+            $this->fail('SqsException was not thrown.');
+        } catch (SqsException $e) {
             $this->assertSame(
                 'SQS SendMessageBatch rejected [1] of [1] messages. First failure [InternalError]: oops',
                 $e->getMessage()
             );
+            $this->assertSame('InternalError', $e->getAwsErrorCode());
+            $this->assertSame('oops', $e->getAwsErrorMessage());
+            $this->assertNotNull($e->getResult());
         }
     }
 

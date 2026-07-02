@@ -2,6 +2,8 @@
 
 namespace Illuminate\Queue;
 
+use Aws\Command;
+use Aws\Sqs\Exception\SqsException;
 use Aws\Sqs\SqsClient;
 use Illuminate\Contracts\Queue\ClearableQueue;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
@@ -9,7 +11,6 @@ use Illuminate\Queue\Jobs\SqsJob;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
-use RuntimeException;
 
 class SqsQueue extends Queue implements QueueContract, ClearableQueue
 {
@@ -471,7 +472,7 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
      * @param  string|null  $queue
      * @return void
      *
-     * @throws \RuntimeException
+     * @throws \Aws\Sqs\Exception\SqsException
      * @throws \Throwable
      */
     protected function sendBatchedMessages(array $messages, $queue)
@@ -512,18 +513,28 @@ class SqsQueue extends Queue implements QueueContract, ClearableQueue
             }
 
             // A batch can return HTTP 200 while still rejecting individual
-            // entries, which does not raise an SqsException. Surface those so
-            // the rejected jobs are not silently dropped.
+            // entries, which the SDK does not raise for. Surface those as the
+            // same SqsException a failed request would throw, carrying the
+            // reported error code and the full result, so the rejected jobs
+            // are not silently dropped.
             if (! empty($result['Failed'])) {
                 $failure = $result['Failed'][0];
 
-                throw new RuntimeException(sprintf(
-                    'SQS SendMessageBatch rejected [%d] of [%d] messages. First failure [%s]: %s',
-                    count($result['Failed']),
-                    count($chunk),
-                    $failure['Code'] ?? 'Unknown',
-                    $failure['Message'] ?? '',
-                ));
+                throw new SqsException(
+                    sprintf(
+                        'SQS SendMessageBatch rejected [%d] of [%d] messages. First failure [%s]: %s',
+                        count($result['Failed']),
+                        count($chunk),
+                        $failure['Code'] ?? 'Unknown',
+                        $failure['Message'] ?? '',
+                    ),
+                    new Command('SendMessageBatch', ['QueueUrl' => $queueUrl, 'Entries' => $chunk]),
+                    [
+                        'code' => $failure['Code'] ?? null,
+                        'message' => $failure['Message'] ?? null,
+                        'result' => $result,
+                    ],
+                );
             }
         }
     }
