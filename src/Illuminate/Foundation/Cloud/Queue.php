@@ -39,6 +39,13 @@ class Queue implements QueueContract, ClearableQueue
     protected $processingJobStartedAt = null;
 
     /**
+     * The identifying details of the currently processing job.
+     *
+     * @var array{id: string|null, name: string|null}
+     */
+    protected $processingJobIdentity = [];
+
+    /**
      * Create a new Queue instance.
      */
     public function __construct(
@@ -142,7 +149,7 @@ class Queue implements QueueContract, ClearableQueue
     {
         $result = $this->queue->pushRaw(...func_get_args());
 
-        $this->finishQueueingJob($queue);
+        $this->finishQueueingJob($queue, $payload);
 
         return $result;
     }
@@ -445,6 +452,9 @@ class Queue implements QueueContract, ClearableQueue
                 default => $default,
             },
             'queue' => $this->processingQueue,
+            ...$this->processingJobIdentity,
+            'attempts' => $this->processingJob->attempts(),
+            'available_at' => $timestamp->toDateTimeString('microsecond'),
             'duration_ms' => (int) $this->processingJobStartedAt->diffInMilliseconds($timestamp),
         ]);
 
@@ -452,6 +462,8 @@ class Queue implements QueueContract, ClearableQueue
             = $this->processingJob
             = $this->processingJobStartedAt
             = null;
+
+        $this->processingJobIdentity = [];
     }
 
     /**
@@ -472,15 +484,48 @@ class Queue implements QueueContract, ClearableQueue
      * Handle jobs finishing being queued.
      *
      * @param  string  $queue
+     * @param  array|string|null  $payload
+     * @param  int|null  $delay
      */
-    public function finishQueueingJob($queue)
+    public function finishQueueingJob($queue, $payload = null, $delay = null)
     {
+        $timestamp = CarbonImmutable::now('UTC');
+
         $this->events->emit([
             '_cloud_event' => 'queue',
-            'timestamp' => CarbonImmutable::now('UTC')->toDateTimeString('microsecond'),
+            'timestamp' => $timestamp->toDateTimeString('microsecond'),
             'type' => 'queued',
             'queue' => $this->normalizeQueue($queue),
+            ...$this->jobIdentity($payload),
+            'attempts' => 0,
+            'available_at' => $timestamp->addSeconds($delay ?? 0)->toDateTimeString('microsecond'),
         ]);
+    }
+
+    /**
+     * Extract the identifying details of a job from its payload.
+     *
+     * The payload arrives as the raw JSON string given to the underlying queue, and
+     * may be absent or malformed when a job was pushed without one, so every field
+     * degrades to null rather than throwing on a hot dispatch path.
+     *
+     * @param  array|string|null  $payload
+     * @return array{id: string|null, name: string|null}
+     */
+    protected function jobIdentity($payload)
+    {
+        if (is_string($payload)) {
+            $payload = json_decode($payload, true);
+        }
+
+        if (! is_array($payload)) {
+            $payload = [];
+        }
+
+        return [
+            'id' => $payload['uuid'] ?? null,
+            'name' => $payload['displayName'] ?? null,
+        ];
     }
 
     /**
@@ -500,11 +545,18 @@ class Queue implements QueueContract, ClearableQueue
         $this->processingQueue = $this->normalizeQueue($queue);
         $this->processingJobStartedAt = CarbonImmutable::now('UTC');
 
+        // Resolved once here rather than again when the job finishes, since reading the
+        // body of an overflowed job re-hydrates it from the cache...
+        $this->processingJobIdentity = $this->jobIdentity($job->getRawBody());
+
         $this->events->emit([
             '_cloud_event' => 'queue',
             'timestamp' => $this->processingJobStartedAt->toDateTimeString('microsecond'),
             'type' => 'started',
             'queue' => $this->processingQueue,
+            ...$this->processingJobIdentity,
+            'attempts' => $job->attempts(),
+            'available_at' => $this->processingJobStartedAt->toDateTimeString('microsecond'),
         ]);
     }
 

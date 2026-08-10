@@ -271,6 +271,10 @@ class QueueTest extends TestCase
             'timestamp' => '2000-01-02 03:04:05.060708',
             'type' => 'started',
             'queue' => 'default',
+            'id' => null,
+            'name' => null,
+            'attempts' => 1,
+            'available_at' => '2000-01-02 03:04:05.060708',
         ]], $eventsFake->emitted);
     }
 
@@ -291,12 +295,20 @@ class QueueTest extends TestCase
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'started',
                 'queue' => 'default',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:06.060708',
                 'type' => 'processed',
                 'queue' => 'default',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:06.060708',
                 'duration_ms' => 1000,
             ],
         ], $eventsFake->emitted);
@@ -342,24 +354,40 @@ class QueueTest extends TestCase
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'started',
                 'queue' => 'first',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'processed',
                 'queue' => 'first',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
                 'duration_ms' => 0,
             ], [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'started',
                 'queue' => 'second',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'processed',
                 'queue' => 'second',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
                 'duration_ms' => 0,
             ],
         ], $eventsFake->emitted);
@@ -486,6 +514,10 @@ class QueueTest extends TestCase
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'started',
                 'queue' => 'default',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'failed_job',
@@ -502,6 +534,10 @@ class QueueTest extends TestCase
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'failed',
                 'queue' => 'default',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
                 'duration_ms' => 0,
             ],
         ], $eventsFake->emitted);
@@ -524,15 +560,82 @@ class QueueTest extends TestCase
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'started',
                 'queue' => 'default',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'released',
                 'queue' => 'default',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-02 03:04:05.060708',
                 'duration_ms' => 0,
             ],
         ], $eventsFake->emitted);
+    }
+
+    public function testItCarriesJobIdentityAcrossTheJobLifecycle()
+    {
+        $this->travelTo('2000-01-02 03:04:05.060708');
+        $eventsFake = $this->fakeEvents();
+        [$queue, $agent] = $this->fakeQueue();
+
+        $agent->pushJob([
+            'body' => json_encode([
+                'uuid' => '00000000-0000-7000-8000-000000000001',
+                'displayName' => 'App\Jobs\SendInvoice',
+                'job' => MyJob::class,
+                'data' => [],
+            ]),
+            'attributes' => ['ApproximateReceiveCount' => 3],
+        ]);
+
+        $job = $queue->pop();
+        $job->release(30);
+        $queue->pop();
+
+        // The uuid is the only thing correlating the two events, so a consumer can tell
+        // that the job which started is the same one that went back onto the queue.
+        $this->assertSame(['started', 'released'], array_column($eventsFake->emitted, 'type'));
+        $this->assertSame([
+            '00000000-0000-7000-8000-000000000001',
+            '00000000-0000-7000-8000-000000000001',
+        ], array_column($eventsFake->emitted, 'id'));
+        $this->assertSame(
+            ['App\Jobs\SendInvoice', 'App\Jobs\SendInvoice'],
+            array_column($eventsFake->emitted, 'name')
+        );
+        $this->assertSame([3, 3], array_column($eventsFake->emitted, 'attempts'));
+    }
+
+    public function testItResolvesJobIdentityOnlyOncePerJob()
+    {
+        $this->fakeEvents();
+        [$queue] = $this->fakeQueue();
+
+        // Reading the body of an overflowed job re-hydrates it from the cache, so the
+        // identity is resolved when the job starts and reused when it finishes.
+        $job = new class extends FakeJob
+        {
+            public int $rawBodyReads = 0;
+
+            public function getRawBody()
+            {
+                $this->rawBodyReads++;
+
+                return json_encode(['uuid' => 'a', 'displayName' => 'b']);
+            }
+        };
+
+        (fn () => $this->startProcessingJob('default', $job))->call($queue);
+        $queue->finishProcessingJob();
+
+        $this->assertSame(1, $job->rawBodyReads);
     }
 
     public function testPopReturnsACloudJobBuiltFromTheAgentResponse()
@@ -949,6 +1052,8 @@ class QueueTest extends TestCase
             'Successful' => array_map(fn ($entry) => ['Id' => $entry['Id'], 'MessageId' => 'id'], $args['Entries']),
         ]));
 
+        Str::createUuidsUsingSequence($this->queuedJobUuids());
+
         $queue->push(new FakeJob, queue: '1');
         $queue->pushOn('2', new FakeJob);
         $queue->pushRaw('', queue: '3');
@@ -956,50 +1061,100 @@ class QueueTest extends TestCase
         $queue->laterOn('5', 1, new FakeJob);
         $queue->bulk([new FakeJob, new FakeJob], queue: '6');
 
+        Str::createUuidsNormally();
+
         $this->assertSame([
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'queued',
                 'queue' => '1',
+                'id' => '00000000-0000-7000-8000-000000000001',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'queued',
                 'queue' => '2',
+                'id' => '00000000-0000-7000-8000-000000000002',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
+                // pushRaw() bypasses createPayload(), so there is no uuid or display name to read.
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'queued',
                 'queue' => '3',
+                'id' => null,
+                'name' => null,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'queued',
                 'queue' => '4',
+                'id' => '00000000-0000-7000-8000-000000000004',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:04:06.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'queued',
                 'queue' => '5',
+                'id' => '00000000-0000-7000-8000-000000000005',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:04:06.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'queued',
                 'queue' => '6',
+                'id' => '00000000-0000-7000-8000-000000000061',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'queued',
                 'queue' => '6',
+                'id' => '00000000-0000-7000-8000-000000000062',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
         ], $eventsFake->emitted);
+    }
+
+    /**
+     * A fixed uuid per job pushed by the dispatch tests, in the order createPayload()
+     * consumes them: queue 1, 2, 4, 5, then both bulk jobs on 6. Queue 3 is pushed
+     * raw and consumes none.
+     *
+     * @return array<int, \Ramsey\Uuid\UuidInterface>
+     */
+    private function queuedJobUuids()
+    {
+        return array_map(fn ($id) => Uuid::fromString("00000000-0000-7000-8000-{$id}"), [
+            '000000000001',
+            '000000000002',
+            '000000000004',
+            '000000000005',
+            '000000000061',
+            '000000000062',
+        ]);
     }
 
     public function testItEmitsReleasedEventWhenWorkerStopsBecauseItTimedOut()
@@ -1026,12 +1181,20 @@ class QueueTest extends TestCase
                     'timestamp' => '2000-01-02 03:04:05.060708',
                     'type' => 'started',
                     'queue' => 'default',
+                    'id' => null,
+                    'name' => null,
+                    'attempts' => 1,
+                    'available_at' => '2000-01-02 03:04:05.060708',
                 ],
                 [
                     '_cloud_event' => 'queue',
                     'timestamp' => '2000-01-02 03:04:07.060708',
                     'type' => 'released',
                     'queue' => 'default',
+                    'id' => null,
+                    'name' => null,
+                    'attempts' => 1,
+                    'available_at' => '2000-01-02 03:04:07.060708',
                     'duration_ms' => 2000,
                 ],
             ], $eventsFake->emitted);
@@ -1073,6 +1236,10 @@ class QueueTest extends TestCase
                     'timestamp' => '2000-01-02 03:04:05.060708',
                     'type' => 'processed',
                     'queue' => 'default',
+                    'id' => null,
+                    'name' => null,
+                    'attempts' => 1,
+                    'available_at' => '2000-01-02 03:04:05.060708',
                     'duration_ms' => 0,
                 ], $eventsFake->emitted[($index * 2) + 1]);
             }
@@ -1104,12 +1271,20 @@ class QueueTest extends TestCase
                     'timestamp' => '2000-01-02 03:04:05.060708',
                     'type' => 'started',
                     'queue' => 'default',
+                    'id' => null,
+                    'name' => null,
+                    'attempts' => 1,
+                    'available_at' => '2000-01-02 03:04:05.060708',
                 ],
                 [
                     '_cloud_event' => 'queue',
                     'timestamp' => '2000-01-02 03:04:05.060708',
                     'type' => 'processed',
                     'queue' => 'default',
+                    'id' => null,
+                    'name' => null,
+                    'attempts' => 1,
+                    'available_at' => '2000-01-02 03:04:05.060708',
                     'duration_ms' => 0,
                 ],
             ], $eventsFake->emitted);
@@ -1209,6 +1384,10 @@ class QueueTest extends TestCase
                     'timestamp' => '2000-01-02 03:04:05.060708',
                     'type' => 'started',
                     'queue' => 'default',
+                    'id' => null,
+                    'name' => null,
+                    'attempts' => 1,
+                    'available_at' => '2000-01-02 03:04:05.060708',
                 ],
             ], $eventsFake->emitted);
         } finally {
@@ -1231,6 +1410,8 @@ class QueueTest extends TestCase
 
         DB::beginTransaction();
 
+        Str::createUuidsUsingSequence($this->queuedJobUuids());
+
         $queue->push(new FakeJob, queue: '1');
         $queue->pushOn('2', new FakeJob);
         $queue->pushRaw('', queue: '3');
@@ -1238,51 +1419,83 @@ class QueueTest extends TestCase
         $queue->laterOn('5', 1, new FakeJob);
         $queue->bulk([new FakeJob, new FakeJob], queue: '6');
 
+        Str::createUuidsNormally();
+
         $this->travel(10)->minutes();
         DB::commit();
 
+        // The payload - and so the uuid - is built when the job is dispatched, but the
+        // event is not emitted until commit, so available_at is relative to the commit.
         $this->assertSame([
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:04:05.060708',
                 'type' => 'queued',
                 'queue' => '3',
+                'id' => null,
+                'name' => null,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:14:05.060708',
                 'type' => 'queued',
                 'queue' => '1',
+                'id' => '00000000-0000-7000-8000-000000000001',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:14:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:14:05.060708',
                 'type' => 'queued',
                 'queue' => '2',
+                'id' => '00000000-0000-7000-8000-000000000002',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:14:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:14:05.060708',
                 'type' => 'queued',
                 'queue' => '4',
+                'id' => '00000000-0000-7000-8000-000000000004',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:14:06.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:14:05.060708',
                 'type' => 'queued',
                 'queue' => '5',
+                'id' => '00000000-0000-7000-8000-000000000005',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:14:06.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:14:05.060708',
                 'type' => 'queued',
                 'queue' => '6',
+                'id' => '00000000-0000-7000-8000-000000000061',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:14:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-02 03:14:05.060708',
                 'type' => 'queued',
                 'queue' => '6',
+                'id' => '00000000-0000-7000-8000-000000000062',
+                'name' => FakeJob::class,
+                'attempts' => 0,
+                'available_at' => '2000-01-02 03:14:05.060708',
             ],
         ], $eventsFake->emitted);
     }
@@ -1323,12 +1536,20 @@ class QueueTest extends TestCase
                 'timestamp' => '2000-01-01 16:04:05.060708',
                 'type' => 'started',
                 'queue' => 'default',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-01 16:04:05.060708',
             ],
             [
                 '_cloud_event' => 'queue',
                 'timestamp' => '2000-01-01 16:04:06.060708',
                 'type' => 'processed',
                 'queue' => 'default',
+                'id' => null,
+                'name' => null,
+                'attempts' => 1,
+                'available_at' => '2000-01-01 16:04:06.060708',
                 'duration_ms' => 1000,
             ],
         ], $eventsFake->emitted);

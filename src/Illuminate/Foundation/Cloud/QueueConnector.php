@@ -91,7 +91,7 @@ class QueueConnector implements ConnectorInterface
     protected function configureQueue(Queue $queue): void
     {
         $this->app['events']->listen(fn (JobQueued $event) => $event->connectionName === $queue->getConnectionName()
-            ? $queue->finishQueueingJob($event->queue)
+            ? $queue->finishQueueingJob($event->queue, $event->payload, $event->delay)
             : null);
     }
 
